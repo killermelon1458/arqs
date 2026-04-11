@@ -1,0 +1,12 @@
+services:
+  arqs-server:
+    build: .
+    container_name: arqs-server
+    ports:
+      - "8080:8080"
+    environment:
+      ARQS_CONFIG: /app/config.toml
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./data:/data
+    restart: unless-stopped
