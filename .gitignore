@@ -1,0 +1,109 @@
+# ----------------------------
+# OS / editor junk
+# ----------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ----------------------------
+# Python
+# ----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# ----------------------------
+# Virtual environments
+# ----------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ----------------------------
+# Build / packaging
+# ----------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ----------------------------
+# Logs
+# ----------------------------
+*.log
+logs/
+*.out
+
+# ----------------------------
+# Local runtime / state / db
+# ----------------------------
+*.db
+*.sqlite
+*.sqlite3
+data/
+state/
+client_state/
+adapter_state/
+discord_adapter_state/
+pulse-state/
+*.pid
+
+# ----------------------------
+# Secrets / local config
+# ----------------------------
+.env
+.env.*
+!.env.example
+
+# ----------------------------
+# Jupyter / IPython
+# ----------------------------
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# ----------------------------
+# Node / frontend junk just in case
+# ----------------------------
+node_modules/
+
+# ----------------------------
+# Java compiled output
+# ----------------------------
+out/
+target/
+*.class
+
+# ----------------------------
+# Keep archives
+# ----------------------------
+# Intentionally NOT ignoring:
+# *.zip
+# *.jar
+# Local actor credential dumps
+client_actor.json
+adapter_actor.json
+*_actor.json
+
+# Local test/runtime scripts and state if you don't want them tracked
+client_state/
+adapter_state/
+discord_adapter_state/
+test_*.py
+
+zip_archive
