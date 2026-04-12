@@ -73,10 +73,11 @@ def register(payload: RegisterRequest, request: Request, db: Annotated[Session, 
     now = utcnow()
     node_id = new_uuid()
     endpoint_id = new_uuid()
-    api_key = generate_api_key()
+    key_id, api_key = generate_api_key()
 
     node = Node(
         node_id=node_id,
+        key_id=key_id,
         api_key_hash=hash_api_key(api_key),
         node_name=payload.node_name,
         created_at=now,
@@ -102,7 +103,7 @@ def register(payload: RegisterRequest, request: Request, db: Annotated[Session, 
 def self_rotate_key(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
     cleanup_expired(db, cfg)
     ensure_node_active(node)
-    api_key = generate_api_key()
+    _key_id, api_key = generate_api_key(node.key_id)
     node.api_key_hash = hash_api_key(api_key)
     db.add(node)
     db.commit()

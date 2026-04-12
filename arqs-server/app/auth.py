@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import secrets
+import uuid
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -17,8 +18,31 @@ from .models import Node
 PBKDF2_ITERATIONS = 390_000
 
 
-def generate_api_key() -> str:
-    return f"arqs_{secrets.token_urlsafe(32)}"
+def generate_key_id() -> str:
+    return str(uuid.uuid4())
+
+
+def generate_api_key(key_id: str | None = None) -> tuple[str, str]:
+    actual_key_id = key_id or generate_key_id()
+    secret = secrets.token_urlsafe(32)
+    return actual_key_id, f"arqs_{actual_key_id}_{secret}"
+
+
+def extract_key_id(api_key: str) -> str | None:
+    value = api_key.strip()
+    if not value.startswith("arqs_"):
+        return None
+    parts = value.split("_", 2)
+    if len(parts) != 3:
+        return None
+    _, key_id, secret = parts
+    if not key_id or not secret:
+        return None
+    try:
+        uuid.UUID(key_id)
+    except ValueError:
+        return None
+    return key_id
 
 
 def hash_api_key(api_key: str) -> str:
@@ -101,14 +125,23 @@ def require_node(
     authorization: AuthorizationHeader = None,
 ) -> Node:
     api_key = _extract_api_key(x_arqs_api_key, authorization)
-    for node in db.execute(select(Node)).scalars():
-        if verify_api_key(api_key, node.api_key_hash):
-            if node.status == "disabled":
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="node disabled")
-            if node.status == "revoked":
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="node revoked")
-            if node.node_id in get_config().blacklist.node_ids:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="node blacklisted")
-            request.state.node_id = node.node_id
-            return node
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+    key_id = extract_key_id(api_key)
+    if key_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+
+    node = db.scalar(select(Node).where(Node.key_id == key_id))
+    if node is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+
+    if not verify_api_key(api_key, node.api_key_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+
+    if node.status == "disabled":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="node disabled")
+    if node.status == "revoked":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="node revoked")
+    if node.node_id in get_config().blacklist.node_ids:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="node blacklisted")
+
+    request.state.node_id = node.node_id
+    return node

@@ -12,13 +12,16 @@ class Base(DeclarativeBase):
 
 class Node(Base):
     __tablename__ = "nodes"
+    __table_args__ = (
+        Index("ix_nodes_key_id", "key_id", unique=True),
+    )
 
     node_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    key_id: Mapped[str] = mapped_column(String(36), nullable=False)
     api_key_hash: Mapped[str] = mapped_column(Text, nullable=False)
     node_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
-
 
 class Endpoint(Base):
     __tablename__ = "endpoints"

@@ -6,6 +6,7 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -21,6 +22,7 @@ LINKS_PATH = APP_DIR / "links.json"
 MESSAGES_PATH = APP_DIR / "messages.jsonl"
 SEEN_DELIVERIES_PATH = APP_DIR / "seen_deliveries.json"
 PENDING_CODES_PATH = APP_DIR / "pending_link_codes.json"
+LOCAL_LINK_CODE_TTL_SECONDS = 15 * 60
 
 DEFAULT_CONFIG = {
     "base_url": "http://127.0.0.1:8000",
@@ -74,6 +76,7 @@ class App:
 
         self.links: list[dict[str, Any]] = JsonStore.load_json(LINKS_PATH, [])
         self.pending_codes: list[dict[str, Any]] = JsonStore.load_json(PENDING_CODES_PATH, [])
+        self._prune_pending_codes()
         self.seen_deliveries: set[str] = set(JsonStore.load_json(SEEN_DELIVERIES_PATH, []))
         self.message_index: set[str] = set()
         self.messages: list[dict[str, Any]] = []
@@ -175,8 +178,25 @@ class App:
         controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         controls.columnconfigure(0, weight=1)
         controls.columnconfigure(1, weight=1)
-        ttk.Button(controls, text="Rename Contact", command=self.rename_contact).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(controls, text="Copy Link Code", command=self.copy_selected_pending_code).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        controls.columnconfigure(2, weight=1)
+
+        ttk.Button(
+            controls,
+            text="Rename Contact",
+            command=self.rename_contact,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        ttk.Button(
+            controls,
+            text="Delete Link",
+            command=self.delete_link,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+
+        ttk.Button(
+            controls,
+            text="Copy Link Code",
+            command=self.copy_selected_pending_code,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         self.conversation_header_var = tk.StringVar(value="No conversation selected")
         ttk.Label(right, textvariable=self.conversation_header_var, font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w")
@@ -242,6 +262,30 @@ class App:
 
     def _save_seen_deliveries(self) -> None:
         JsonStore.save_json(SEEN_DELIVERIES_PATH, sorted(self.seen_deliveries))
+
+    def _pending_code_is_expired(self, item: dict[str, Any]) -> bool:
+        expires_at = item.get("local_expires_at")
+        if not expires_at:
+            return True
+        try:
+            dt = datetime.fromisoformat(str(expires_at))
+        except ValueError:
+            return True
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+
+    def _prune_pending_codes(self) -> None:
+        original = len(self.pending_codes)
+        self.pending_codes = [
+            item for item in self.pending_codes
+            if not self._pending_code_is_expired(item)
+        ]
+        if len(self.pending_codes) != original:
+            self._save_pending_codes()
+
+    def _future_iso(self, seconds: int) -> str:
+        return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
     def _refresh_client_from_disk(self) -> None:
         base_url = self.base_url_var.get().strip()
@@ -449,10 +493,9 @@ class App:
 
         def job() -> LinkCode:
             return client.request_link_code(source_endpoint_id, requested_mode=requested_mode)
-
+      
         def done(link_code: LinkCode) -> None:
-            self.pending_codes = [item for item in self.pending_codes if item.get("code") != link_code.code]
-            self.pending_codes.append(
+            self.pending_codes = [
                 {
                     "code": link_code.code,
                     "link_code_id": str(link_code.link_code_id),
@@ -460,9 +503,10 @@ class App:
                     "requested_mode": link_code.requested_mode,
                     "created_at": link_code.created_at.isoformat(),
                     "expires_at": link_code.expires_at.isoformat(),
+                    "local_expires_at": self._future_iso(LOCAL_LINK_CODE_TTL_SECONDS),
                     "status": link_code.status,
                 }
-            )
+            ]
             self._save_pending_codes()
             self.root.clipboard_clear()
             self.root.clipboard_append(link_code.code)
@@ -473,9 +517,11 @@ class App:
         self.run_bg(job, on_success=done, label="Requesting link code")
 
     def redeem_link_code(self) -> None:
+
         client = self.require_client()
         if client is None:
             return
+        self._prune_pending_codes()
         dialog = RedeemLinkDialog(self.root, self.endpoints, self.config.get("local_endpoint_aliases", {}))
         if not dialog.result:
             return
@@ -527,16 +573,75 @@ class App:
         self._refresh_conversations()
         self.set_status("Contact label updated.")
 
-    def copy_selected_pending_code(self) -> None:
-        if not self.pending_codes:
-            messagebox.showerror(APP_NAME, "No pending link codes saved locally.")
+    def delete_link(self) -> None:
+        client = self.require_client()
+        if client is None:
             return
-        valid_codes = [item for item in self.pending_codes if str(item.get("status", "active")).lower() == "active"]
-        item = valid_codes[0] if valid_codes else self.pending_codes[0]
+
+        convo = self.get_selected_conversation()
+        if convo is None:
+            messagebox.showerror(APP_NAME, "Select a conversation first.")
+            return
+
+        record = self._get_link_record(convo.local_endpoint_id, convo.remote_endpoint_id)
+        if record is None:
+            messagebox.showerror(APP_NAME, "This conversation has no saved link record yet.")
+            return
+
+        confirmed = ask_continue_cancel(
+            self.root,
+            "Delete Link",
+            "Warning: this will delete the link and all message history. "
+            "This cannot be undone.\n\nAre you sure?",
+        )
+        if not confirmed:
+            self.set_status("Delete link cancelled.")
+            return
+
+        link_id = str(record.get("link_id") or "")
+
+        def job() -> dict[str, Any]:
+            revoke_error: str | None = None
+            if link_id and not link_id.startswith("local-"):
+                try:
+                    client.revoke_link(link_id)
+                except Exception as exc:
+                    revoke_error = str(exc)
+
+            return {
+                "local_endpoint_id": convo.local_endpoint_id,
+                "remote_endpoint_id": convo.remote_endpoint_id,
+                "link_id": link_id,
+                "revoke_error": revoke_error,
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            self._delete_link_local(result["local_endpoint_id"], result["remote_endpoint_id"])
+            if result["revoke_error"]:
+                self.set_status(
+                    f"Deleted local link/history, but server revoke failed: {result['revoke_error']}"
+                )
+                messagebox.showwarning(
+                    APP_NAME,
+                    "Local link and history were deleted, but server-side revoke failed:\n\n"
+                    f"{result['revoke_error']}",
+                )
+            else:
+                self.set_status("Link and message history deleted.")
+
+        self.run_bg(job, on_success=done, label="Deleting link")
+
+    def copy_selected_pending_code(self) -> None:
+        self._prune_pending_codes()
+        if not self.pending_codes:
+            messagebox.showerror(APP_NAME, "No unexpired link code is saved locally.")
+            return
+
+        item = self.pending_codes[0]
         code = str(item["code"])
         self.root.clipboard_clear()
         self.root.clipboard_append(code)
-        self.set_status(f"Copied pending link code {code}.")
+        self.set_status(f"Copied current link code {code}.")
 
     def send_message(self) -> None:
         client = self.require_client()
@@ -785,6 +890,64 @@ class App:
                 return item
         return None
 
+    def _delete_link_local(self, local_endpoint_id: str, remote_endpoint_id: str) -> None:
+        self.links = [
+            item
+            for item in self.links
+            if not (
+                str(item.get("local_endpoint_id")) == local_endpoint_id
+                and str(item.get("remote_endpoint_id")) == remote_endpoint_id
+            )
+        ]
+
+        self.messages = [
+            item
+            for item in self.messages
+            if not (
+                str(item.get("local_endpoint_id")) == local_endpoint_id
+                and str(item.get("remote_endpoint_id")) == remote_endpoint_id
+            )
+        ]
+
+        self.message_index = {
+            str(item.get("packet_id") or item.get("delivery_id"))
+            for item in self.messages
+            if item.get("packet_id") or item.get("delivery_id")
+        }
+
+        self._save_links()
+        MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MESSAGES_PATH.open("w", encoding="utf-8") as handle:
+            for item in self.messages:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+        if self.selected_conversation_key == self._conversation_key(local_endpoint_id, remote_endpoint_id):
+            self.selected_conversation_key = None
+
+        self._save_config()
+        self._refresh_conversations()
+
+    def _clear_local_identity_state(self) -> None:
+        self.links = []
+        self.pending_codes = []
+        self.seen_deliveries = set()
+        self.messages = []
+        self.message_index = set()
+        self.endpoints = []
+        self.endpoint_map = {}
+        self.conversations = []
+        self.selected_conversation_key = None
+        self.config["local_endpoint_aliases"] = {}
+
+        self._save_links()
+        self._save_pending_codes()
+        self._save_seen_deliveries()
+        MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MESSAGES_PATH.write_text("", encoding="utf-8")
+
+        self._save_config()
+        self._refresh_conversations()
+
     def require_client(self, *, silent: bool = False) -> ARQSClient | None:
         if self.client is None:
             self._refresh_client_from_disk()
@@ -959,6 +1122,57 @@ class App:
         self._save_config()
         self.root.destroy()
 
+class ContinueCancelDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, title: str, message: str) -> None:
+        super().__init__(parent)
+        self.result = False
+        self.title(title)
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        container = ttk.Frame(self, padding=12)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(container, text=message, wraplength=460, justify="left").grid(
+            row=0, column=0, sticky="w"
+        )
+
+        buttons = ttk.Frame(container)
+        buttons.grid(row=1, column=0, sticky="e", pady=(12, 0))
+
+        self.cancel_button = ttk.Button(buttons, text="Cancel", command=self._cancel)
+        self.cancel_button.grid(row=0, column=0, padx=(0, 8))
+
+        self.continue_button = ttk.Button(buttons, text="Continue", command=self._continue)
+        self.continue_button.grid(row=0, column=1)
+
+        self.bind("<Return>", lambda _event: self._cancel())
+        self.bind("<Escape>", lambda _event: self._cancel())
+
+        self.update_idletasks()
+        parent_widget = parent.winfo_toplevel()
+        x = parent_widget.winfo_rootx() + 60
+        y = parent_widget.winfo_rooty() + 60
+        self.geometry(f"+{x}+{y}")
+
+        self.cancel_button.focus_set()
+        self.wait_window(self)
+
+    def _continue(self) -> None:
+        self.result = True
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = False
+        self.destroy()
+
+
+def ask_continue_cancel(parent: tk.Misc, title: str, message: str) -> bool:
+    dialog = ContinueCancelDialog(parent, title, message)
+    return dialog.result
 
 class EndpointDialog(simpledialog.Dialog):
     def __init__(self, parent: tk.Misc, title: str) -> None:
