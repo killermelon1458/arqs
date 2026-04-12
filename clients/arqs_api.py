@@ -17,7 +17,7 @@ Design choices in this client:
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib import error as urllib_error
@@ -502,7 +502,10 @@ def _parse_uuid_or_none(value: Any) -> uuid.UUID | None:
 
 
 def _parse_datetime(value: Any) -> datetime:
-    return datetime.fromisoformat(str(value))
+    dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _parse_datetime_or_none(value: Any) -> datetime | None:

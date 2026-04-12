@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -323,28 +323,51 @@ def redeem_link_code(
     cleanup_expired(db, cfg)
     ensure_node_active(node)
     dest_endpoint = ensure_node_owns_endpoint(db, node.node_id, str(payload.destination_endpoint_id))
+
     code = db.scalar(select(LinkCode).where(LinkCode.code == payload.code))
     if code is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="link code not found")
-    if code.status != "active":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="link code not active")
+
     if code.expires_at <= utcnow():
         code.status = "expired"
         db.add(code)
         db.commit()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="link code expired")
+
+    if code.status != "active":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="link code not active")
+
     if code.source_endpoint_id == str(dest_endpoint.endpoint_id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="cannot self-link endpoint")
-    if exact_active_link_exists(db, code.source_endpoint_id, str(dest_endpoint.endpoint_id), code.requested_mode):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate active link")
+
+    # Atomic claim step:
+    # exactly one concurrent redeemer should be able to transition this code
+    # from active -> used. The loser gets a clean 409.
+    claim = db.execute(
+        update(LinkCode)
+        .where(
+            LinkCode.link_code_id == code.link_code_id,
+            LinkCode.status == "active",
+        )
+        .values(status="used")
+    )
+    if claim.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="link code not active")
 
     source_endpoint = db.get(Endpoint, code.source_endpoint_id)
     if source_endpoint is None or source_endpoint.status != "active":
+        db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="source endpoint unavailable")
+
+    if exact_active_link_exists(db, code.source_endpoint_id, str(dest_endpoint.endpoint_id), code.requested_mode):
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate active link")
 
     routes = resolve_redeem_routes(code.source_endpoint_id, str(dest_endpoint.endpoint_id), code.requested_mode)
     for route_from, route_to in routes:
         if active_route_exists(db, route_from, route_to):
+            db.rollback()
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="active route already exists")
 
     now = utcnow()
@@ -358,6 +381,7 @@ def redeem_link_code(
     )
     db.add(link)
     db.flush()
+
     for route_from, route_to in routes:
         db.add(
             DirectedRoute(
@@ -369,8 +393,7 @@ def redeem_link_code(
                 created_by_link_id=link.link_id,
             )
         )
-    code.status = "used"
-    db.add(code)
+
     db.commit()
     db.refresh(link)
     return link

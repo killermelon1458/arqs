@@ -5,14 +5,14 @@ import queue
 import threading
 import tkinter as tk
 from dataclasses import dataclass
-from datetime import datetime, timezone
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
 
-from arqs_api import ARQSClient, ARQSError, ARQSHTTPError, Endpoint, Link, LinkCode
+from arqs_api import ARQSClient, ARQSHTTPError, Endpoint, Link, LinkCode
 
 APP_NAME = "ARQS Messages GUI"
 APP_DIR = Path.home() / ".arqs_messages_gui"
@@ -23,6 +23,8 @@ MESSAGES_PATH = APP_DIR / "messages.jsonl"
 SEEN_DELIVERIES_PATH = APP_DIR / "seen_deliveries.json"
 PENDING_CODES_PATH = APP_DIR / "pending_link_codes.json"
 LOCAL_LINK_CODE_TTL_SECONDS = 15 * 60
+display_timezone = False
+
 
 DEFAULT_CONFIG = {
     "base_url": "http://127.0.0.1:8000",
@@ -641,6 +643,70 @@ class App:
             return
 
         record = self._get_link_record(convo.local_endpoint_id, convo.remote_endpoint_id)
+        link_id = str(record.get("link_id") or "") if record is not None else ""
+
+        if record is None:
+            warning_text = (
+                "Warning: this conversation has no saved link record. "
+                "The local conversation history will be deleted, but there may be no server-side link to revoke. "
+                "This cannot be undone.\n\nAre you sure?"
+            )
+        else:
+            warning_text = (
+                "Warning: this will delete the link and all message history. "
+                "This cannot be undone.\n\nAre you sure?"
+            )
+
+        confirmed = ask_continue_cancel(
+            self.root,
+            "Delete Link",
+            warning_text,
+        )
+        if not confirmed:
+            self.set_status("Delete link cancelled.")
+            return
+
+        def job() -> dict[str, Any]:
+            revoke_error: str | None = None
+            if link_id and not link_id.startswith("local-"):
+                try:
+                    client.revoke_link(link_id)
+                except Exception as exc:
+                    revoke_error = str(exc)
+
+            return {
+                "local_endpoint_id": convo.local_endpoint_id,
+                "remote_endpoint_id": convo.remote_endpoint_id,
+                "link_id": link_id,
+                "had_record": record is not None,
+                "revoke_error": revoke_error,
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            self._delete_link_local(result["local_endpoint_id"], result["remote_endpoint_id"])
+
+            if result["revoke_error"]:
+                self.set_status(
+                    f"Deleted local conversation/history, but server revoke failed: {result['revoke_error']}"
+                )
+                messagebox.showwarning(
+                    APP_NAME,
+                    "Local conversation/history was deleted, but server-side revoke failed:\n\n"
+                    f"{result['revoke_error']}",
+                )
+            elif result["had_record"]:
+                self.set_status("Link and message history deleted.")
+            else:
+                self.set_status("Conversation history deleted. No saved link record existed to revoke.")
+
+        self.run_bg(job, on_success=done, label="Deleting link")
+
+        convo = self.get_selected_conversation()
+        if convo is None:
+            messagebox.showerror(APP_NAME, "Select a conversation first.")
+            return
+
+        record = self._get_link_record(convo.local_endpoint_id, convo.remote_endpoint_id)
         if record is None:
             messagebox.showerror(APP_NAME, "This conversation has no saved link record yet.")
             return
@@ -1233,7 +1299,17 @@ class App:
             dt = datetime.fromisoformat(str(value))
         except ValueError:
             return str(value)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        dt = dt.astimezone()
+        if display_timezone:
+            return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+            
+        else:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+         
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
