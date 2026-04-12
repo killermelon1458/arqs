@@ -6,6 +6,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .auth import generate_api_key, get_client_ip, hash_api_key, require_node
@@ -359,12 +360,61 @@ def send_packet(
         state="queued",
         last_attempt_at=None,
     )
-    db.add(packet)
-    db.flush()
-    db.add(delivery)
-    db.commit()
-    return PacketSendResponse(result="accepted", packet_id=packet.packet_id, delivery_id=delivery.delivery_id, expires_at=packet.expires_at)
 
+    try:
+        db.add(packet)
+        db.flush()
+        db.add(delivery)
+        db.commit()
+        return PacketSendResponse(
+            result="accepted",
+            packet_id=packet.packet_id,
+            delivery_id=delivery.delivery_id,
+            expires_at=packet.expires_at,
+        )
+    except IntegrityError:
+        db.rollback()
+
+        existing = None
+        existing_delivery = None
+
+        # Give the competing request a moment to finish committing so we can
+        # translate the race cleanly instead of leaking a 500.
+        for _ in range(5):
+            existing = db.get(Packet, str(payload.packet_id))
+            if existing is not None:
+                existing_delivery = db.scalar(select(Delivery).where(Delivery.packet_id == existing.packet_id))
+                break
+            time.sleep(0.05)
+
+        if existing is not None:
+            if packet_matches(
+                existing,
+                sender_node_id=node.node_id,
+                from_endpoint_id=str(payload.from_endpoint_id),
+                to_endpoint_id=str(payload.to_endpoint_id),
+                headers=payload.headers,
+                body=payload.body,
+                data=payload.data,
+                meta=payload.meta,
+                version=payload.version,
+            ):
+                return PacketSendResponse(
+                    result="duplicate",
+                    packet_id=existing.packet_id,
+                    delivery_id=(existing_delivery.delivery_id if existing_delivery else None),
+                    expires_at=existing.expires_at,
+                )
+
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="packet_id already used for different packet",
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="packet_id collision during concurrent send",
+        )
 
 @app.get("/inbox", response_model=InboxResponse)
 def poll_inbox(
