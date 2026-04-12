@@ -133,11 +133,11 @@ class App:
         self.active_poll_var = tk.BooleanVar(value=bool(self.config.get("active_polling", False)))
         ttk.Checkbutton(
             top,
-            text="Active polling",
+            text="Automatically fetch inbox",
             variable=self.active_poll_var,
             command=self.toggle_active_polling,
         ).grid(row=1, column=2, padx=2, pady=(8, 0), sticky="w")
-        ttk.Button(top, text="Poll Once", command=lambda: self.poll_inbox(background=True, wait=0)).grid(
+        ttk.Button(top, text="Refresh inbox", command=lambda: self.poll_inbox(background=True, wait=0)).grid(
             row=1, column=3, padx=2, pady=(8, 0)
         )
 
@@ -351,12 +351,14 @@ class App:
             for item in self.messages
             if self._conversation_key(str(item["local_endpoint_id"]), str(item["remote_endpoint_id"])) == convo.key
         ]
-        relevant.sort(key=lambda item: str(item.get("created_at") or item.get("received_at") or ""))
+        relevant.sort(key=self._message_sort_key)
+
+        contact_name = convo.title
 
         lines: list[str] = []
         for item in relevant:
             direction = item.get("direction", "unknown")
-            who = "You" if direction == "outgoing" else "Them"
+            who = "You" if direction == "outgoing" else contact_name
             timestamp = self._format_dt(item.get("created_at") or item.get("received_at"))
             body = str(item.get("body") or "")
             if not body and item.get("data"):
@@ -692,7 +694,7 @@ class App:
         self.poll_stop.clear()
         self.poll_thread = threading.Thread(target=self._poll_loop, name="arqs-gui-poll", daemon=True)
         self.poll_thread.start()
-        self.set_status("Active polling enabled.")
+        self.set_status("Automatically fetching inbox enabled.")
 
     def _stop_poll_thread(self) -> None:
         self.poll_stop.set()
@@ -877,6 +879,24 @@ class App:
     # --------------------------
     # Formatting
     # --------------------------
+
+    def _message_sort_key(self, item: dict[str, Any]) -> tuple[datetime, datetime, str]:
+        created_dt = self._parse_message_dt(item.get("created_at"))
+        received_dt = self._parse_message_dt(item.get("received_at"))
+        tie_breaker = str(item.get("packet_id") or item.get("delivery_id") or "")
+        return (created_dt, received_dt, tie_breaker)
+
+    def _parse_message_dt(self, value: Any) -> datetime:
+        if not value:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     def _conversation_key(self, local_endpoint_id: str, remote_endpoint_id: str) -> str:
         return f"{local_endpoint_id}|{remote_endpoint_id}"
 

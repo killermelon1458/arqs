@@ -1,0 +1,37 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+app_name = "ARQS Server"
+api_key_header = "X-ARQS-API-Key"
+
+[storage]
+db_path = "/data/arqs.db"
+sqlite_wal = true
+
+[retention]
+default_packet_ttl_seconds = 2592000
+no_expiry = false
+link_code_ttl_seconds = 600
+
+[limits]
+max_storage_bytes = 42949672960
+max_packet_bytes = 262144
+max_queued_packets_per_endpoint = 10000
+max_queued_bytes_per_endpoint = 1073741824
+max_queued_bytes_per_node = 5368709120
+max_total_queued_packets = 100000
+max_total_queued_bytes = 42949672960
+max_inbox_batch = 200
+long_poll_max_seconds = 30
+
+[rate_limit]
+send_window_seconds = 60
+max_sends_per_window = 600
+
+[network]
+trusted_proxies = []
+trusted_forwarded_headers = ["x-forwarded-for", "x-real-ip"]
+
+[blacklist]
+client_ips = []
+node_ids = []
