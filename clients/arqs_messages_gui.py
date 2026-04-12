@@ -124,10 +124,11 @@ class App:
 
         ttk.Button(top, text="Load Identity", command=self.load_identity).grid(row=0, column=2, padx=2)
         ttk.Button(top, text="Register Node", command=self.register_node).grid(row=0, column=3, padx=2)
-        ttk.Button(top, text="Create Endpoint", command=self.create_endpoint).grid(row=0, column=4, padx=2)
-        ttk.Button(top, text="Request Link Code", command=self.request_link_code).grid(row=0, column=5, padx=2)
-        ttk.Button(top, text="Redeem Link Code", command=self.redeem_link_code).grid(row=0, column=6, padx=2)
-        ttk.Button(top, text="Refresh", command=lambda: self.refresh_everything(background=True)).grid(row=0, column=7, padx=2)
+        ttk.Button(top, text="Delete Node", command=self.delete_node).grid(row=0, column=4, padx=2)
+        ttk.Button(top, text="Create Endpoint", command=self.create_endpoint).grid(row=0, column=5, padx=2)
+        ttk.Button(top, text="Request Link Code", command=self.request_link_code).grid(row=0, column=6, padx=2)
+        ttk.Button(top, text="Redeem Link Code", command=self.redeem_link_code).grid(row=0, column=7, padx=2)
+        ttk.Button(top, text="Refresh", command=lambda: self.refresh_everything(background=True)).grid(row=0, column=8, padx=2)
 
         ttk.Label(top, text="Node name").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.node_name_var = tk.StringVar(value=str(self.config.get("node_name", "")))
@@ -455,6 +456,62 @@ class App:
 
         self.run_bg(job, on_success=done, label="Registering node")
 
+    def delete_node(self) -> None:
+        client = self.require_client()
+        if client is None:
+            return
+
+        confirmed = ask_continue_cancel(
+            self.root,
+            "Delete Node",
+            "Warning: this will delete this node identity from the server and remove all local links, "
+            "messages, and the saved identity file. This cannot be undone.\n\nAre you sure?",
+        )
+        if not confirmed:
+            self.set_status("Delete node cancelled.")
+            return
+
+        def job() -> dict[str, Any]:
+            result = client.delete_identity()
+            return {
+                "node_id": str(result.node_id),
+                "endpoints_deleted": result.endpoints_deleted,
+                "links_deleted": result.links_deleted,
+                "routes_deleted": result.routes_deleted,
+                "link_codes_deleted": result.link_codes_deleted,
+                "packets_deleted": result.packets_deleted,
+                "deliveries_deleted": result.deliveries_deleted,
+                "send_events_deleted": result.send_events_deleted,
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            self._stop_poll_thread()
+            self._set_polling_ui(False)
+            self.config["active_polling"] = False
+
+            try:
+                IDENTITY_PATH.unlink()
+            except FileNotFoundError:
+                pass
+
+            self._clear_local_identity_state()
+            self.client = ARQSClient(self.base_url_var.get().strip())
+
+            summary = (
+                f"Deleted node {result['node_id']} "
+                f"(endpoints={result['endpoints_deleted']}, "
+                f"links={result['links_deleted']}, "
+                f"routes={result['routes_deleted']}, "
+                f"link_codes={result['link_codes_deleted']}, "
+                f"packets={result['packets_deleted']}, "
+                f"deliveries={result['deliveries_deleted']}, "
+                f"send_events={result['send_events_deleted']})."
+            )
+            self.set_status(summary)
+            messagebox.showinfo(APP_NAME, summary)
+
+        self.run_bg(job, on_success=done, label="Deleting node")
+
     def create_endpoint(self) -> None:
         client = self.require_client()
         if client is None:
@@ -712,11 +769,10 @@ class App:
         def done(result: dict[str, Any]) -> None:
             self.endpoints = result["endpoints"]
             self.endpoint_map = {str(item.endpoint_id): item for item in self.endpoints}
-            for link in result["links"]:
-                self._upsert_link_record(link)
+            self._rebuild_server_link_records(result["links"])
             self._refresh_conversations()
-            self.set_status(f"Loaded {len(self.endpoints)} endpoints and {len(self.links)} saved links.")
-
+            self.set_status(f"Loaded {len(self.endpoints)} endpoints and {len(self.links)} local link records.")
+            
         if background:
             self.run_bg(job, on_success=done, label="Refreshing endpoints and links")
         else:
@@ -852,22 +908,90 @@ class App:
         )
         self._save_links()
 
-    def _upsert_link_record(self, link: Link, explicit_remote_label: str | None = None) -> None:
+    def _resolve_link_endpoints(self, link: Link) -> tuple[str, str] | None:
         endpoint_ids = {str(item.endpoint_id) for item in self.endpoints}
         a = str(link.endpoint_a_id)
         b = str(link.endpoint_b_id)
 
         if a in endpoint_ids and b not in endpoint_ids:
-            local_endpoint_id, remote_endpoint_id = a, b
-        elif b in endpoint_ids and a not in endpoint_ids:
-            local_endpoint_id, remote_endpoint_id = b, a
-        elif a in endpoint_ids and b in endpoint_ids:
-            local_endpoint_id, remote_endpoint_id = a, b
-        else:
+            return a, b
+        if b in endpoint_ids and a not in endpoint_ids:
+            return b, a
+        if a in endpoint_ids and b in endpoint_ids:
+            return a, b
+        return None
+
+    def _rebuild_server_link_records(self, server_links: list[Link]) -> None:
+        existing_labels = {
+            (str(item.get("local_endpoint_id")), str(item.get("remote_endpoint_id"))): str(item.get("remote_label") or "")
+            for item in self.links
+            if not str(item.get("link_id", "")).startswith("local-")
+        }
+
+        local_stubs = [
+            item
+            for item in self.links
+            if str(item.get("link_id", "")).startswith("local-")
+        ]
+
+        rebuilt: list[dict[str, Any]] = []
+        active_pairs: set[tuple[str, str]] = set()
+
+        for link in server_links:
+            if link.status != "active":
+                continue
+
+            resolved = self._resolve_link_endpoints(link)
+            if resolved is None:
+                continue
+
+            local_endpoint_id, remote_endpoint_id = resolved
+            active_pairs.add((local_endpoint_id, remote_endpoint_id))
+
+            remote_label = (
+                existing_labels.get((local_endpoint_id, remote_endpoint_id))
+                or f"Endpoint {remote_endpoint_id[:8]}"
+            )
+
+            rebuilt.append(
+                {
+                    "link_id": str(link.link_id),
+                    "mode": link.mode,
+                    "local_endpoint_id": local_endpoint_id,
+                    "remote_endpoint_id": remote_endpoint_id,
+                    "remote_label": remote_label,
+                    "created_at": link.created_at.isoformat(),
+                    "updated_at": self._now_iso(),
+                    "status": link.status,
+                }
+            )
+
+        preserved_stubs = [
+            item
+            for item in local_stubs
+            if (
+                str(item.get("local_endpoint_id")),
+                str(item.get("remote_endpoint_id")),
+            ) not in active_pairs
+        ]
+
+        self.links = rebuilt + preserved_stubs
+        self._save_links()
+
+    def _upsert_link_record(self, link: Link, explicit_remote_label: str | None = None) -> None:
+        resolved = self._resolve_link_endpoints(link)
+        if resolved is None:
             return
 
+        local_endpoint_id, remote_endpoint_id = resolved
+
         record = self._get_link_record(local_endpoint_id, remote_endpoint_id)
-        remote_label = explicit_remote_label or (record.get("remote_label") if record else None) or f"Endpoint {remote_endpoint_id[:8]}"
+        remote_label = (
+            explicit_remote_label
+            or (record.get("remote_label") if record else None)
+            or f"Endpoint {remote_endpoint_id[:8]}"
+        )
+
         payload = {
             "link_id": str(link.link_id),
             "mode": link.mode,
@@ -878,12 +1002,13 @@ class App:
             "updated_at": self._now_iso(),
             "status": link.status,
         }
+
         if record is None:
             self.links.append(payload)
         else:
             record.update(payload)
-        self._save_links()
 
+        self._save_links()
     def _get_link_record(self, local_endpoint_id: str, remote_endpoint_id: str) -> dict[str, Any] | None:
         for item in self.links:
             if str(item.get("local_endpoint_id")) == local_endpoint_id and str(item.get("remote_endpoint_id")) == remote_endpoint_id:

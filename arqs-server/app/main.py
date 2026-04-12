@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from .auth import generate_api_key, get_client_ip, hash_api_key, require_node
 from .db import get_config, get_db, init_db
-from .models import Delivery, DirectedRoute, Endpoint, Link, LinkCode, Node, Packet
+from .models import Delivery, DirectedRoute, Endpoint, Link, LinkCode, Node, Packet, SendEvent
 from .schemas import (
+    DeleteIdentityResponse,
     EndpointCreateRequest,
     EndpointOut,
     HealthResponse,
@@ -110,6 +111,122 @@ def self_rotate_key(node: Annotated[Node, Depends(require_node)], db: Annotated[
     db.commit()
     return RotateKeyResponse(node_id=node.node_id, api_key=api_key)
 
+@app.delete("/identity", response_model=DeleteIdentityResponse)
+def delete_identity(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
+    cleanup_expired(db, cfg)
+
+    endpoint_ids = [
+        row[0]
+        for row in db.execute(
+            select(Endpoint.endpoint_id).where(Endpoint.node_id == node.node_id)
+        ).all()
+    ]
+
+    endpoints_deleted = len(endpoint_ids)
+
+    if endpoint_ids:
+        links_deleted = int(
+            db.scalar(
+                select(func.count()).select_from(Link).where(
+                    or_(
+                        Link.endpoint_a_id.in_(endpoint_ids),
+                        Link.endpoint_b_id.in_(endpoint_ids),
+                    )
+                )
+            )
+            or 0
+        )
+
+        routes_deleted = int(
+            db.scalar(
+                select(func.count()).select_from(DirectedRoute).where(
+                    or_(
+                        DirectedRoute.from_endpoint_id.in_(endpoint_ids),
+                        DirectedRoute.to_endpoint_id.in_(endpoint_ids),
+                    )
+                )
+            )
+            or 0
+        )
+
+        link_codes_deleted = int(
+            db.scalar(
+                select(func.count()).select_from(LinkCode).where(
+                    LinkCode.source_endpoint_id.in_(endpoint_ids)
+                )
+            )
+            or 0
+        )
+
+        packets_deleted = int(
+            db.scalar(
+                select(func.count()).select_from(Packet).where(
+                    or_(
+                        Packet.sender_node_id == node.node_id,
+                        Packet.from_endpoint_id.in_(endpoint_ids),
+                        Packet.to_endpoint_id.in_(endpoint_ids),
+                    )
+                )
+            )
+            or 0
+        )
+
+        deliveries_deleted = int(
+            db.scalar(
+                select(func.count()).select_from(Delivery).where(
+                    or_(
+                        Delivery.destination_node_id == node.node_id,
+                        Delivery.destination_endpoint_id.in_(endpoint_ids),
+                    )
+                )
+            )
+            or 0
+        )
+    else:
+        links_deleted = 0
+        routes_deleted = 0
+        link_codes_deleted = 0
+        packets_deleted = int(
+            db.scalar(
+                select(func.count()).select_from(Packet).where(
+                    Packet.sender_node_id == node.node_id
+                )
+            )
+            or 0
+        )
+        deliveries_deleted = int(
+            db.scalar(
+                select(func.count()).select_from(Delivery).where(
+                    Delivery.destination_node_id == node.node_id
+                )
+            )
+            or 0
+        )
+
+    send_events_deleted = int(
+        db.scalar(
+            select(func.count()).select_from(SendEvent).where(
+                SendEvent.node_id == node.node_id
+            )
+        )
+        or 0
+    )
+
+    node_id = node.node_id
+    db.delete(node)
+    db.commit()
+
+    return DeleteIdentityResponse(
+        deleted=True,
+        node_id=node_id,
+        endpoints_deleted=endpoints_deleted,
+        links_deleted=links_deleted,
+        routes_deleted=routes_deleted,
+        link_codes_deleted=link_codes_deleted,
+        packets_deleted=packets_deleted,
+        deliveries_deleted=deliveries_deleted,
+        send_events_deleted=send_events_deleted,
+    )
 
 @app.get("/endpoints", response_model=list[EndpointOut])
 def list_endpoints(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
@@ -262,16 +379,24 @@ def redeem_link_code(
 @app.get("/links", response_model=list[LinkOut])
 def list_links(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
     cleanup_expired(db, cfg)
-    endpoint_ids = [row[0] for row in db.execute(select(Endpoint.endpoint_id).where(Endpoint.node_id == node.node_id)).all()]
+    endpoint_ids = [
+        row[0]
+        for row in db.execute(
+            select(Endpoint.endpoint_id).where(Endpoint.node_id == node.node_id)
+        ).all()
+    ]
     if not endpoint_ids:
         return []
+
     rows = db.execute(
         select(Link)
-        .where(or_(Link.endpoint_a_id.in_(endpoint_ids), Link.endpoint_b_id.in_(endpoint_ids)))
+        .where(
+            Link.status == "active",
+            or_(Link.endpoint_a_id.in_(endpoint_ids), Link.endpoint_b_id.in_(endpoint_ids)),
+        )
         .order_by(Link.created_at.desc())
     ).scalars().all()
     return rows
-
 
 @app.delete("/links/{link_id}")
 def revoke_link(link_id: str, node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):

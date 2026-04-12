@@ -25,6 +25,16 @@ class RotateKeyResponse(BaseModel):
     node_id: UUID
     api_key: str
 
+class DeleteIdentityResponse(BaseModel):
+    deleted: bool
+    node_id: UUID
+    endpoints_deleted: int
+    links_deleted: int
+    routes_deleted: int
+    link_codes_deleted: int
+    packets_deleted: int
+    deliveries_deleted: int
+    send_events_deleted: int
 
 class EndpointCreateRequest(BaseModel):
     endpoint_name: str | None = Field(default=None, max_length=255)

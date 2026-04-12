@@ -99,6 +99,18 @@ class RotatedKey:
     node_id: uuid.UUID
     api_key: str
 
+@dataclass(frozen=True)
+class IdentityDeleteResult:
+    deleted: bool
+    node_id: uuid.UUID
+    endpoints_deleted: int
+    links_deleted: int
+    routes_deleted: int
+    link_codes_deleted: int
+    packets_deleted: int
+    deliveries_deleted: int
+    send_events_deleted: int
+
 
 @dataclass(frozen=True)
 class Endpoint:
@@ -262,6 +274,24 @@ class ARQSClient:
                     default_endpoint_id=self.identity.default_endpoint_id,
                 )
         return rotated
+
+    def delete_identity(self, *, clear_client_identity: bool = True) -> IdentityDeleteResult:
+        data = self._request_json("DELETE", "/identity", require_auth=True)
+        result = IdentityDeleteResult(
+            deleted=bool(data["deleted"]),
+            node_id=_parse_uuid(data["node_id"]),
+            endpoints_deleted=int(data["endpoints_deleted"]),
+            links_deleted=int(data["links_deleted"]),
+            routes_deleted=int(data["routes_deleted"]),
+            link_codes_deleted=int(data["link_codes_deleted"]),
+            packets_deleted=int(data["packets_deleted"]),
+            deliveries_deleted=int(data["deliveries_deleted"]),
+            send_events_deleted=int(data["send_events_deleted"]),
+        )
+        if clear_client_identity:
+            self.api_key = None
+            self.identity = None
+        return result
 
     def list_endpoints(self) -> list[Endpoint]:
         data = self._request_json("GET", "/endpoints", require_auth=True)
@@ -546,6 +576,7 @@ __all__ = [
     "ARQSConnectionError",
     "NodeIdentity",
     "RotatedKey",
+    "IdentityDeleteResult",
     "Endpoint",
     "LinkCode",
     "Link",
