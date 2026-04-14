@@ -231,7 +231,10 @@ def delete_identity(node: Annotated[Node, Depends(require_node)], db: Annotated[
 @app.get("/endpoints", response_model=list[EndpointOut])
 def list_endpoints(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
     cleanup_expired(db, cfg)
-    rows = db.execute(select(Endpoint).where(Endpoint.node_id == node.node_id).order_by(Endpoint.created_at.asc())).scalars().all()
+    db.commit()
+    rows = db.execute(
+        select(Endpoint).where(Endpoint.node_id == node.node_id).order_by(Endpoint.created_at.asc())
+    ).scalars().all()
     return rows
 
 
@@ -402,6 +405,7 @@ def redeem_link_code(
 @app.get("/links", response_model=list[LinkOut])
 def list_links(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
     cleanup_expired(db, cfg)
+    db.commit()
     endpoint_ids = [
         row[0]
         for row in db.execute(
@@ -658,13 +662,21 @@ def ack_packet(
 @app.get("/health", response_model=HealthResponse)
 def health(db: Annotated[Session, Depends(get_db)]):
     cleanup_expired(db, cfg)
+    db.commit()
     db.execute(select(1)).scalar_one()
+    return HealthResponse(
+        status="ok",
+        app=cfg.server.app_name,
+        db_path=cfg.storage.db_path,
+        time=datetime.now(UTC).replace(tzinfo=None),
+    )
     return HealthResponse(status="ok", app=cfg.server.app_name, db_path=cfg.storage.db_path, time=datetime.now(UTC).replace(tzinfo=None))
 
 
 @app.get("/stats", response_model=StatsResponse)
 def stats(db: Annotated[Session, Depends(get_db)]):
     cleanup_expired(db, cfg)
+    db.commit()
     nodes_total = int(db.scalar(select(func.count()).select_from(Node)) or 0)
     endpoints_total = int(db.scalar(select(func.count()).select_from(Endpoint)) or 0)
     active_links_total = int(db.scalar(select(func.count()).select_from(Link).where(Link.status == "active")) or 0)

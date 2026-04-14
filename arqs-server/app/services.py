@@ -57,34 +57,46 @@ def ensure_node_active(node: Node) -> None:
 
 def cleanup_expired(db: Session, cfg: AppConfig) -> dict[str, int]:
     now = utcnow()
+    mutated = False
+
     expired_codes = db.execute(
         select(LinkCode).where(LinkCode.status == "active", LinkCode.expires_at <= now)
     ).scalars().all()
     for code in expired_codes:
         code.status = "expired"
+        mutated = True
 
     expired_packets = db.execute(
         select(Packet).where(Packet.expires_at.is_not(None), Packet.expires_at <= now)
     ).scalars().all()
     expired_packet_ids = {packet.packet_id for packet in expired_packets}
     if expired_packet_ids:
-        deliveries = db.execute(select(Delivery).where(Delivery.packet_id.in_(expired_packet_ids))).scalars().all()
+        deliveries = db.execute(
+            select(Delivery).where(Delivery.packet_id.in_(expired_packet_ids))
+        ).scalars().all()
         for delivery in deliveries:
             db.delete(delivery)
+            mutated = True
         for packet in expired_packets:
             db.delete(packet)
+            mutated = True
 
     window_floor = now - timedelta(seconds=cfg.rate_limit.send_window_seconds * 2)
-    old_events = db.execute(select(SendEvent).where(SendEvent.created_at < window_floor)).scalars().all()
+    old_events = db.execute(
+        select(SendEvent).where(SendEvent.created_at < window_floor)
+    ).scalars().all()
     for event in old_events:
         db.delete(event)
+        mutated = True
+
+    if mutated:
+        db.flush()
 
     return {
         "expired_link_codes": len(expired_codes),
         "expired_packets": len(expired_packet_ids),
         "pruned_send_events": len(old_events),
     }
-
 
 def packet_expiry(now: datetime, cfg: AppConfig, ttl_seconds: int | None) -> datetime | None:
     if cfg.retention.no_expiry and ttl_seconds is None:

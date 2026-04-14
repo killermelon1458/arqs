@@ -108,3 +108,5 @@ test_*.py
 
 zip_archive
 clients/arqs_messages_gui_2.py
+tests/testing.md
+ARQS_Testing.md
