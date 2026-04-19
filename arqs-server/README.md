@@ -43,7 +43,7 @@ A node authenticates with its API key and may only act on endpoints it owns. A p
 
 Delivery is **at least once**. If a delivery is polled but not ACKed, clients must tolerate seeing the same `packet_id` again.
 
-ACK is **transport-only**. It means the destination node acknowledged handling of the delivery at the transport layer. It does not mean a human read the payload.
+ACK is **transport-only**. In the current server, `POST /packet_ack` means the destination node asked the server to retire a queued delivery that belongs to that node. On success, the server deletes the delivery and its packet from the queue. It does **not** mean a human read the payload, and by itself it does not prove anything about client-side UX, rendering, persistence, or higher-level application handling.
 
 ## Server behavior summary
 
@@ -68,7 +68,14 @@ Identity deletion is destructive. It removes the node and cascades through owned
 
 ### Endpoints
 
-A node may own multiple endpoints. The default endpoint cannot be deleted. Non-default endpoints can be created and deleted, but deletion is blocked if the endpoint is still actively linked or still has queued deliveries.
+A node may own multiple endpoints. The default endpoint cannot be deleted.
+
+A non-default endpoint can be deleted only if:
+
+* it is not part of any active link
+* it has no active inbound queued deliveries addressed to that endpoint
+
+Revoked links do not block deletion, and expired packets do not count as queued deliveries for this check.
 
 ### Links
 
@@ -88,18 +95,48 @@ Revoking a link also revokes the directed routes created from that link.
 
 Packets are versioned transport objects submitted with a caller-supplied `packet_id`. The current implementation accepts `version = 1` only.
 
-A packet must include at least one of:
+The packet send request schema is:
+
+* `version`: integer, must be `1`
+* `packet_id`: UUID
+* `from_endpoint_id`: UUID
+* `to_endpoint_id`: UUID
+* `headers`: JSON object
+* `body`: string or null
+* `data`: JSON object
+* `meta`: JSON object
+* `ttl_seconds`: optional integer, minimum `1`
+
+At least one of the following must be present:
 
 * `body`
 * non-empty `data`
 
-If the same `packet_id` is submitted again with identical content, ARQS returns a duplicate result instead of creating a second queued delivery. If the same `packet_id` is reused with different content, ARQS rejects it.
+Server-side validation and transport semantics:
+
+* `from_endpoint_id` must belong to the authenticated node
+* `to_endpoint_id` must exist and be active
+* the destination node must be active
+* an active directed route must exist from `from_endpoint_id` to `to_endpoint_id`
+* the encoded packet envelope must not exceed the current `max_packet_bytes` limit
+
+The server derives and stores additional transport fields, including:
+
+* `sender_node_id` from the authenticated node
+* `expires_at` from the requested TTL or the server default TTL
+* `payload_bytes` as the computed encoded size
+
+If the same `packet_id` is submitted again with identical content, ARQS returns a duplicate result instead of creating a second queued delivery. If the same `packet_id` is reused with different content, ARQS rejects it as a conflict.
 
 ### Inbox polling and ACK
 
 Inbox polling is done at **node scope**, not endpoint scope. The destination node receives deliveries for its owned endpoints.
 
-Polling can long-poll up to the configured server maximum. Returned deliveries are marked as delivered. A later `POST /packet_ack` removes the delivery and its packet from the server.
+Polling can long-poll up to the current server-side `long_poll_max_seconds` limit. If the caller asks for a larger `wait`, the server clamps it down to that maximum.
+
+`GET /inbox` is read-only with respect to delivery state: it returns queued deliveries for the destination node, and if a delivery is polled but not ACKed, it remains queued and may be returned again on a later poll.
+
+`POST /packet_ack` is the operation that retires a queued delivery. The server verifies that the addressed delivery belongs to the authenticated destination node, then deletes the delivery row and its packet. That ACK is a server-side queue-removal signal, not a human-read receipt and not a general statement about what a client did with the payload after polling it.
 
 ## Security model
 
@@ -132,6 +169,31 @@ Major configuration areas:
 * `rate_limit`: send-rate window and maximum sends per window
 * `network`: trusted proxies and trusted forwarded headers
 * `blacklist`: blocked client IPs and blocked node IDs
+
+Some values, especially queue/rate limits and related operational controls, seed live runtime settings on startup and can then be changed without editing the static config file or restarting the server. The local admin CLI is the intended server-side interface for inspecting and changing those live runtime settings.
+
+### IP access control
+
+Client IP access is controlled by `network.ip_access_mode`, which has three modes:
+
+* `off`
+  The server does not enforce client-IP access rules.
+
+* `config`
+  The server uses only the static config denylist in `blacklist.client_ips`. Requests from listed IPs are denied. All other IPs are allowed.
+
+* `dynamic`
+  The server uses live database-backed IP rules plus a runtime default policy. Resolution order is:
+  1. explicit dynamic rule for the client IP, if present
+  2. static fallback denylist in `blacklist.client_ips`
+  3. live `default_ip_policy` from runtime settings
+
+In `dynamic` mode, the system can operate either as:
+
+* default allow with explicit deny rules
+* default deny with explicit allow rules
+
+Separately from client IP policy, `blacklist.node_ids` denies authenticated access for listed node IDs.
 
 ## Docker
 
