@@ -26,6 +26,7 @@ def _sqlite_pragmas(dbapi_connection, _connection_record):
     cursor.execute("PRAGMA foreign_keys=ON")
     if _cfg.storage.sqlite_wal:
         cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute(f"PRAGMA busy_timeout={int(_cfg.storage.sqlite_busy_timeout_ms)}")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
@@ -39,6 +40,8 @@ def get_engine():
 
 def init_db() -> None:
     Base.metadata.create_all(_engine)
+    with _engine.begin() as conn:
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_packets_expires_at ON packets (expires_at)")
 
 
 @contextmanager

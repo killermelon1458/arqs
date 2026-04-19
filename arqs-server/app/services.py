@@ -8,9 +8,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
+from .admin_services import get_runtime_settings
 from .config import AppConfig
 from .models import Delivery, DirectedRoute, Endpoint, Link, LinkCode, Node, Packet, SendEvent
 
@@ -55,47 +56,77 @@ def ensure_node_active(node: Node) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"node {node.status}")
 
 
+def active_packet_clause(*, now: datetime | None = None):
+    current = now or utcnow()
+    return or_(Packet.expires_at.is_(None), Packet.expires_at > current)
+
+
+def is_packet_expired(packet: Packet, *, now: datetime | None = None) -> bool:
+    current = now or utcnow()
+    return packet.expires_at is not None and packet.expires_at <= current
+
+
+def active_link_code_clause(*, now: datetime | None = None):
+    current = now or utcnow()
+    return and_(LinkCode.status == "active", LinkCode.expires_at > current)
+
+
+def effective_link_code_status(code: LinkCode, *, now: datetime | None = None) -> str:
+    current = now or utcnow()
+    if code.status == "active" and code.expires_at <= current:
+        return "expired"
+    return code.status
+
+
+def current_storage_usage_bytes(cfg: AppConfig) -> int:
+    db_path = Path(cfg.storage.db_path)
+    candidates = [
+        db_path,
+        db_path.with_name(f"{db_path.name}-wal"),
+        db_path.with_name(f"{db_path.name}-shm"),
+        db_path.with_name(f"{db_path.name}-journal"),
+    ]
+    total = 0
+    for candidate in candidates:
+        try:
+            total += candidate.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 def cleanup_expired(db: Session, cfg: AppConfig) -> dict[str, int]:
     now = utcnow()
-    mutated = False
+    runtime_settings = get_runtime_settings(db)
 
-    expired_codes = db.execute(
-        select(LinkCode).where(LinkCode.status == "active", LinkCode.expires_at <= now)
-    ).scalars().all()
-    for code in expired_codes:
-        code.status = "expired"
-        mutated = True
+    expired_codes = int(
+        db.execute(
+            update(LinkCode)
+            .where(LinkCode.status == "active", LinkCode.expires_at <= now)
+            .values(status="expired")
+        ).rowcount
+        or 0
+    )
 
-    expired_packets = db.execute(
-        select(Packet).where(Packet.expires_at.is_not(None), Packet.expires_at <= now)
-    ).scalars().all()
-    expired_packet_ids = {packet.packet_id for packet in expired_packets}
-    if expired_packet_ids:
-        deliveries = db.execute(
-            select(Delivery).where(Delivery.packet_id.in_(expired_packet_ids))
-        ).scalars().all()
-        for delivery in deliveries:
-            db.delete(delivery)
-            mutated = True
-        for packet in expired_packets:
-            db.delete(packet)
-            mutated = True
+    expired_packets = int(
+        db.execute(
+            delete(Packet).where(Packet.expires_at.is_not(None), Packet.expires_at <= now)
+        ).rowcount
+        or 0
+    )
 
-    window_floor = now - timedelta(seconds=cfg.rate_limit.send_window_seconds * 2)
-    old_events = db.execute(
-        select(SendEvent).where(SendEvent.created_at < window_floor)
-    ).scalars().all()
-    for event in old_events:
-        db.delete(event)
-        mutated = True
-
-    if mutated:
-        db.flush()
+    window_floor = now - timedelta(seconds=int(runtime_settings["send_window_seconds"]) * 2)
+    old_events = int(
+        db.execute(
+            delete(SendEvent).where(SendEvent.created_at < window_floor)
+        ).rowcount
+        or 0
+    )
 
     return {
-        "expired_link_codes": len(expired_codes),
-        "expired_packets": len(expired_packet_ids),
-        "pruned_send_events": len(old_events),
+        "expired_link_codes": expired_codes,
+        "expired_packets": expired_packets,
+        "pruned_send_events": old_events,
     }
 
 def packet_expiry(now: datetime, cfg: AppConfig, ttl_seconds: int | None) -> datetime | None:
@@ -107,26 +138,31 @@ def packet_expiry(now: datetime, cfg: AppConfig, ttl_seconds: int | None) -> dat
 
 def enforce_send_rate_limit(db: Session, cfg: AppConfig, node_id: str) -> None:
     now = utcnow()
-    floor = now - timedelta(seconds=cfg.rate_limit.send_window_seconds)
+    runtime_settings = get_runtime_settings(db)
+    floor = now - timedelta(seconds=int(runtime_settings["send_window_seconds"]))
     count = db.scalar(
         select(func.count()).select_from(SendEvent).where(SendEvent.node_id == node_id, SendEvent.created_at >= floor)
     )
-    if count >= cfg.rate_limit.max_sends_per_window:
+    if count >= int(runtime_settings["max_sends_per_window"]):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="send rate limit exceeded")
     db.add(SendEvent(event_id=new_uuid(), node_id=node_id, created_at=now))
 
 
 def enforce_queue_limits(db: Session, cfg: AppConfig, dest_endpoint_id: str, dest_node_id: str, packet_bytes: int) -> None:
+    now = utcnow()
+    runtime_settings = get_runtime_settings(db)
+    active_packets = active_packet_clause(now=now)
+
     endpoint_counts = db.execute(
         select(func.count(Delivery.delivery_id), func.coalesce(func.sum(Packet.payload_bytes), 0))
         .select_from(Delivery)
         .join(Packet, Packet.packet_id == Delivery.packet_id)
-        .where(Delivery.destination_endpoint_id == dest_endpoint_id)
+        .where(Delivery.destination_endpoint_id == dest_endpoint_id, active_packets)
     ).one()
     endpoint_packets, endpoint_bytes = int(endpoint_counts[0]), int(endpoint_counts[1] or 0)
-    if endpoint_packets >= cfg.limits.max_queued_packets_per_endpoint:
+    if endpoint_packets >= int(runtime_settings["max_queued_packets_per_endpoint"]):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="destination endpoint queue packet cap reached")
-    if endpoint_bytes + packet_bytes > cfg.limits.max_queued_bytes_per_endpoint:
+    if endpoint_bytes + packet_bytes > int(runtime_settings["max_queued_bytes_per_endpoint"]):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="destination endpoint queue byte cap reached")
 
     node_bytes = int(
@@ -134,26 +170,28 @@ def enforce_queue_limits(db: Session, cfg: AppConfig, dest_endpoint_id: str, des
             select(func.coalesce(func.sum(Packet.payload_bytes), 0))
             .select_from(Delivery)
             .join(Packet, Packet.packet_id == Delivery.packet_id)
-            .where(Delivery.destination_node_id == dest_node_id)
+            .where(Delivery.destination_node_id == dest_node_id, active_packets)
         )
         or 0
     )
-    if node_bytes + packet_bytes > cfg.limits.max_queued_bytes_per_node:
+    if node_bytes + packet_bytes > int(runtime_settings["max_queued_bytes_per_node"]):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="destination node queue byte cap reached")
 
     total_counts = db.execute(
         select(func.count(Delivery.delivery_id), func.coalesce(func.sum(Packet.payload_bytes), 0))
         .select_from(Delivery)
         .join(Packet, Packet.packet_id == Delivery.packet_id)
+        .where(active_packets)
     ).one()
     total_packets, total_bytes = int(total_counts[0]), int(total_counts[1] or 0)
-    if total_packets >= cfg.limits.max_total_queued_packets:
+    if total_packets >= int(runtime_settings["max_total_queued_packets"]):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="global queue packet cap reached")
-    if total_bytes + packet_bytes > cfg.limits.max_total_queued_bytes:
+    if total_bytes + packet_bytes > int(runtime_settings["max_total_queued_bytes"]):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="global queue byte cap reached")
 
-    db_path = Path(cfg.storage.db_path)
-    if db_path.exists() and db_path.stat().st_size > cfg.limits.max_storage_bytes:
+    storage_bytes = current_storage_usage_bytes(cfg)
+    max_storage_bytes = int(runtime_settings["max_storage_bytes"])
+    if storage_bytes >= max_storage_bytes or storage_bytes + packet_bytes > max_storage_bytes:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="storage cap reached")
 
 

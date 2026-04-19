@@ -7,12 +7,15 @@ api_key_header = "X-ARQS-API-Key"
 [storage]
 db_path = "/data/arqs.db"
 sqlite_wal = true
+sqlite_busy_timeout_ms = 5000
 
 [retention]
 default_packet_ttl_seconds = 2592000
 no_expiry = false
 link_code_ttl_seconds = 600
 
+# These values seed the runtime_settings row on first boot.
+# After startup, the admin CLI can change these live without restarting.
 [limits]
 max_storage_bytes = 42949672960
 max_packet_bytes = 262144
@@ -24,6 +27,8 @@ max_total_queued_bytes = 42949672960
 max_inbox_batch = 200
 long_poll_max_seconds = 30
 
+# These values also seed runtime_settings on first boot and then become
+# live-editable through the local admin CLI.
 [rate_limit]
 send_window_seconds = 60
 max_sends_per_window = 600
@@ -31,7 +36,13 @@ max_sends_per_window = 600
 [network]
 trusted_proxies = []
 trusted_forwarded_headers = ["x-forwarded-for", "x-real-ip"]
+ip_access_mode = "dynamic"
 
+[maintenance]
+cleanup_interval_seconds = 60
+
+# When ip_access_mode = "config", this is the only client IP block list used.
+# When ip_access_mode = "dynamic", this remains a static fallback deny list.
 [blacklist]
 client_ips = []
 node_ids = []

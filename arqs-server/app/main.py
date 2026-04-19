@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import logging
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .admin_services import ensure_admin_tables, get_runtime_settings, is_ip_allowed
 from .auth import generate_api_key, get_client_ip, hash_api_key, require_node
-from .db import get_config, get_db, init_db
+from .db import get_config, get_db, init_db, session_scope
 from .models import Delivery, DirectedRoute, Endpoint, Link, LinkCode, Node, Packet, SendEvent
 from .schemas import (
     DeleteIdentityResponse,
@@ -33,11 +37,14 @@ from .schemas import (
 )
 from .services import (
     active_route_exists,
+    active_link_code_clause,
+    active_packet_clause,
     cleanup_expired,
     enforce_queue_limits,
     enforce_send_rate_limit,
     ensure_node_active,
     ensure_node_owns_endpoint,
+    is_packet_expired,
     exact_active_link_exists,
     generate_link_code,
     new_uuid,
@@ -51,27 +58,69 @@ from .services import (
 cfg = get_config()
 app = FastAPI(title=cfg.server.app_name, version="1.0.0")
 init_db()
+logger = logging.getLogger(__name__)
+_maintenance_stop_event = threading.Event()
+_maintenance_thread: threading.Thread | None = None
+
+
+def _maintenance_loop(stop_event: threading.Event) -> None:
+    interval = int(cfg.maintenance.cleanup_interval_seconds)
+    if interval <= 0:
+        return
+    while not stop_event.wait(interval):
+        try:
+            with session_scope() as db:
+                cleanup_expired(db, cfg)
+        except Exception:
+            logger.exception("ARQS maintenance cleanup failed")
 
 
 @app.on_event("startup")
 def on_startup() -> None:
+    global _maintenance_thread
     init_db()
+    with session_scope() as db:
+        ensure_admin_tables(db, cfg)
+    _maintenance_stop_event.clear()
+    interval = int(cfg.maintenance.cleanup_interval_seconds)
+    if interval > 0 and (_maintenance_thread is None or not _maintenance_thread.is_alive()):
+        _maintenance_thread = threading.Thread(
+            target=_maintenance_loop,
+            args=(_maintenance_stop_event,),
+            name="arqs-maintenance",
+            daemon=True,
+        )
+        _maintenance_thread.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    global _maintenance_thread
+    _maintenance_stop_event.set()
+    if _maintenance_thread is not None and _maintenance_thread.is_alive():
+        _maintenance_thread.join(timeout=2.0)
+    _maintenance_thread = None
 
 
 @app.middleware("http")
-async def no_store_header(_request: Request, call_next):
-    response: Response = await call_next(_request)
+async def enforce_ip_policy_and_no_store(request: Request, call_next):
+    client_ip = get_client_ip(request)
+    with session_scope() as db:
+        if not is_ip_allowed(db, client_ip, cfg=cfg):
+            response = JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "client IP denied"},
+            )
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+    response: Response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
     return response
 
 
 @app.post("/register", response_model=RegisterResponse)
-def register(payload: RegisterRequest, request: Request, db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
-    client_ip = get_client_ip(request)
-    if client_ip in cfg.blacklist.client_ips:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="registration denied")
-
+def register(payload: RegisterRequest, db: Annotated[Session, Depends(get_db)]):
     now = utcnow()
     node_id = new_uuid()
     endpoint_id = new_uuid()
@@ -103,7 +152,6 @@ def register(payload: RegisterRequest, request: Request, db: Annotated[Session, 
 
 @app.post("/identity/rotate-key", response_model=RotateKeyResponse)
 def self_rotate_key(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
     ensure_node_active(node)
     _key_id, api_key = generate_api_key(node.key_id)
     node.api_key_hash = hash_api_key(api_key)
@@ -113,8 +161,6 @@ def self_rotate_key(node: Annotated[Node, Depends(require_node)], db: Annotated[
 
 @app.delete("/identity", response_model=DeleteIdentityResponse)
 def delete_identity(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
-
     endpoint_ids = [
         row[0]
         for row in db.execute(
@@ -230,8 +276,6 @@ def delete_identity(node: Annotated[Node, Depends(require_node)], db: Annotated[
 
 @app.get("/endpoints", response_model=list[EndpointOut])
 def list_endpoints(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
-    db.commit()
     rows = db.execute(
         select(Endpoint).where(Endpoint.node_id == node.node_id).order_by(Endpoint.created_at.asc())
     ).scalars().all()
@@ -244,7 +288,6 @@ def create_endpoint(
     node: Annotated[Node, Depends(require_node)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    cleanup_expired(db, cfg)
     ensure_node_active(node)
     endpoint = Endpoint(
         endpoint_id=new_uuid(),
@@ -263,7 +306,7 @@ def create_endpoint(
 
 @app.delete("/endpoints/{endpoint_id}")
 def delete_endpoint(endpoint_id: str, node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
+    now = utcnow()
     endpoint = ensure_node_owns_endpoint(db, node.node_id, endpoint_id)
     if endpoint.endpoint_name == "default":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="default endpoint deletion not allowed")
@@ -273,7 +316,12 @@ def delete_endpoint(endpoint_id: str, node: Annotated[Node, Depends(require_node
             or_(Link.endpoint_a_id == endpoint_id, Link.endpoint_b_id == endpoint_id),
         )
     )
-    queued = db.scalar(select(func.count()).select_from(Delivery).where(Delivery.destination_endpoint_id == endpoint_id))
+    queued = db.scalar(
+        select(func.count(Delivery.delivery_id))
+        .select_from(Delivery)
+        .join(Packet, Packet.packet_id == Delivery.packet_id)
+        .where(Delivery.destination_endpoint_id == endpoint_id, active_packet_clause(now=now))
+    )
     if linked or queued:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="endpoint still linked or queued")
     db.delete(endpoint)
@@ -287,7 +335,6 @@ def request_link_code(
     node: Annotated[Node, Depends(require_node)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    cleanup_expired(db, cfg)
     ensure_node_active(node)
     ensure_node_owns_endpoint(db, node.node_id, str(payload.source_endpoint_id))
     now = utcnow()
@@ -295,7 +342,7 @@ def request_link_code(
     code_value = None
     for _ in range(20):
         candidate = generate_link_code()
-        exists = db.scalar(select(LinkCode.link_code_id).where(LinkCode.code == candidate, LinkCode.status == "active"))
+        exists = db.scalar(select(LinkCode.link_code_id).where(LinkCode.code == candidate))
         if not exists:
             code_value = candidate
             break
@@ -323,7 +370,6 @@ def redeem_link_code(
     node: Annotated[Node, Depends(require_node)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    cleanup_expired(db, cfg)
     ensure_node_active(node)
     dest_endpoint = ensure_node_owns_endpoint(db, node.node_id, str(payload.destination_endpoint_id))
 
@@ -404,8 +450,6 @@ def redeem_link_code(
 
 @app.get("/links", response_model=list[LinkOut])
 def list_links(node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
-    db.commit()
     endpoint_ids = [
         row[0]
         for row in db.execute(
@@ -427,7 +471,6 @@ def list_links(node: Annotated[Node, Depends(require_node)], db: Annotated[Sessi
 
 @app.delete("/links/{link_id}")
 def revoke_link(link_id: str, node: Annotated[Node, Depends(require_node)], db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
     link = db.get(Link, link_id)
     if link is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="link not found")
@@ -450,7 +493,6 @@ def send_packet(
     node: Annotated[Node, Depends(require_node)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    cleanup_expired(db, cfg)
     ensure_node_active(node)
     ensure_node_owns_endpoint(db, node.node_id, str(payload.from_endpoint_id))
     dest_endpoint = db.get(Endpoint, str(payload.to_endpoint_id))
@@ -465,10 +507,15 @@ def send_packet(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="no active directed route")
 
     packet_bytes = payload_size_bytes(headers=payload.headers, body=payload.body, data=payload.data, meta=payload.meta)
-    if packet_bytes > cfg.limits.max_packet_bytes:
+    runtime_settings = get_runtime_settings(db)
+    if packet_bytes > int(runtime_settings["max_packet_bytes"]):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="packet exceeds max packet bytes")
 
     existing = db.get(Packet, str(payload.packet_id))
+    if existing is not None and is_packet_expired(existing):
+        db.delete(existing)
+        db.flush()
+        existing = None
     if existing is not None:
         if packet_matches(
             existing,
@@ -534,6 +581,10 @@ def send_packet(
         # translate the race cleanly instead of leaking a 500.
         for _ in range(5):
             existing = db.get(Packet, str(payload.packet_id))
+            if existing is not None and is_packet_expired(existing):
+                db.delete(existing)
+                db.flush()
+                existing = None
             if existing is not None:
                 existing_delivery = db.scalar(select(Delivery).where(Delivery.packet_id == existing.packet_id))
                 break
@@ -575,37 +626,31 @@ def poll_inbox(
     wait: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1),
 ):
-    cleanup_expired(db, cfg)
     ensure_node_active(node)
-    wait = min(wait, cfg.limits.long_poll_max_seconds)
-    limit = min(limit, cfg.limits.max_inbox_batch)
+    runtime_settings = get_runtime_settings(db)
+    wait = min(wait, int(runtime_settings["long_poll_max_seconds"]))
+    limit = min(limit, int(runtime_settings["max_inbox_batch"]))
 
     deadline = time.monotonic() + wait
-    deliveries: list[Delivery] = []
+    rows = []
     while True:
-        deliveries = db.execute(
-            select(Delivery)
-            .where(Delivery.destination_node_id == node.node_id, Delivery.state.in_(["queued", "delivered"]))
+        rows = db.execute(
+            select(Delivery, Packet)
+            .join(Packet, Packet.packet_id == Delivery.packet_id)
+            .where(
+                Delivery.destination_node_id == node.node_id,
+                Delivery.state == "queued",
+                active_packet_clause(now=utcnow()),
+            )
             .order_by(Delivery.queued_at.asc())
             .limit(limit)
-        ).scalars().all()
-        if deliveries or time.monotonic() >= deadline:
+        ).all()
+        if rows or time.monotonic() >= deadline:
             break
         time.sleep(0.5)
-        cleanup_expired(db, cfg)
 
-    packet_ids = [delivery.packet_id for delivery in deliveries]
-    packets = {packet.packet_id: packet for packet in db.execute(select(Packet).where(Packet.packet_id.in_(packet_ids))).scalars().all()} if packet_ids else {}
-
-    now = utcnow()
     results = []
-    for delivery in deliveries:
-        packet = packets.get(delivery.packet_id)
-        if packet is None:
-            continue
-        delivery.state = "delivered"
-        delivery.last_attempt_at = now
-        db.add(delivery)
+    for delivery, packet in rows:
         results.append(
             {
                 "delivery_id": delivery.delivery_id,
@@ -627,7 +672,6 @@ def poll_inbox(
                 },
             }
         )
-    db.commit()
     return InboxResponse(deliveries=results)
 
 
@@ -637,20 +681,28 @@ def ack_packet(
     node: Annotated[Node, Depends(require_node)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    cleanup_expired(db, cfg)
     ensure_node_active(node)
 
-    delivery = None
+    delivery_row = None
+    now = utcnow()
     if payload.delivery_id:
-        delivery = db.get(Delivery, str(payload.delivery_id))
+        delivery_row = db.execute(
+            select(Delivery, Packet)
+            .join(Packet, Packet.packet_id == Delivery.packet_id)
+            .where(Delivery.delivery_id == str(payload.delivery_id), active_packet_clause(now=now))
+        ).first()
     elif payload.packet_id:
-        delivery = db.scalar(select(Delivery).where(Delivery.packet_id == str(payload.packet_id)))
-    if delivery is None:
+        delivery_row = db.execute(
+            select(Delivery, Packet)
+            .join(Packet, Packet.packet_id == Delivery.packet_id)
+            .where(Packet.packet_id == str(payload.packet_id), active_packet_clause(now=now))
+        ).first()
+    if delivery_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="delivery not found")
+    delivery, packet = delivery_row
     if delivery.destination_node_id != node.node_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="delivery not owned by node")
 
-    packet = db.get(Packet, delivery.packet_id)
     packet_id = delivery.packet_id
     db.delete(delivery)
     if packet is not None:
@@ -661,8 +713,6 @@ def ack_packet(
 
 @app.get("/health", response_model=HealthResponse)
 def health(db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
-    db.commit()
     db.execute(select(1)).scalar_one()
     return HealthResponse(
         status="ok",
@@ -670,22 +720,35 @@ def health(db: Annotated[Session, Depends(get_db)]):
         db_path=cfg.storage.db_path,
         time=datetime.now(UTC).replace(tzinfo=None),
     )
-    return HealthResponse(status="ok", app=cfg.server.app_name, db_path=cfg.storage.db_path, time=datetime.now(UTC).replace(tzinfo=None))
 
 
 @app.get("/stats", response_model=StatsResponse)
 def stats(db: Annotated[Session, Depends(get_db)]):
-    cleanup_expired(db, cfg)
-    db.commit()
+    now = utcnow()
     nodes_total = int(db.scalar(select(func.count()).select_from(Node)) or 0)
     endpoints_total = int(db.scalar(select(func.count()).select_from(Endpoint)) or 0)
     active_links_total = int(db.scalar(select(func.count()).select_from(Link).where(Link.status == "active")) or 0)
-    queued_packets_total = int(db.scalar(select(func.count()).select_from(Delivery)) or 0)
-    queued_bytes_total = int(
-        db.scalar(select(func.coalesce(func.sum(Packet.payload_bytes), 0)).select_from(Delivery).join(Packet, Packet.packet_id == Delivery.packet_id))
+    queued_packets_total = int(
+        db.scalar(
+            select(func.count(Delivery.delivery_id))
+            .select_from(Delivery)
+            .join(Packet, Packet.packet_id == Delivery.packet_id)
+            .where(active_packet_clause(now=now))
+        )
         or 0
     )
-    link_codes_active_total = int(db.scalar(select(func.count()).select_from(LinkCode).where(LinkCode.status == "active")) or 0)
+    queued_bytes_total = int(
+        db.scalar(
+            select(func.coalesce(func.sum(Packet.payload_bytes), 0))
+            .select_from(Delivery)
+            .join(Packet, Packet.packet_id == Delivery.packet_id)
+            .where(active_packet_clause(now=now))
+        )
+        or 0
+    )
+    link_codes_active_total = int(
+        db.scalar(select(func.count()).select_from(LinkCode).where(active_link_code_clause(now=now))) or 0
+    )
     return StatsResponse(
         nodes_total=nodes_total,
         endpoints_total=endpoints_total,

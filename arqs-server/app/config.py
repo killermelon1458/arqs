@@ -18,6 +18,7 @@ class ServerConfig:
 class StorageConfig:
     db_path: str = "/data/arqs.db"
     sqlite_wal: bool = True
+    sqlite_busy_timeout_ms: int = 5000
 
 
 @dataclass(slots=True)
@@ -50,6 +51,12 @@ class RateLimitConfig:
 class NetworkConfig:
     trusted_proxies: list[str] = field(default_factory=list)
     trusted_forwarded_headers: list[str] = field(default_factory=lambda: ["x-forwarded-for", "x-real-ip"])
+    ip_access_mode: str = "dynamic"
+
+
+@dataclass(slots=True)
+class MaintenanceConfig:
+    cleanup_interval_seconds: int = 60
 
 
 @dataclass(slots=True)
@@ -66,6 +73,7 @@ class AppConfig:
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
+    maintenance: MaintenanceConfig = field(default_factory=MaintenanceConfig)
     blacklist: BlacklistConfig = field(default_factory=BlacklistConfig)
 
 
@@ -93,6 +101,8 @@ def load_config() -> AppConfig:
             _overlay_dataclass(config.rate_limit, raw["rate_limit"])
         if isinstance(raw.get("network"), dict):
             _overlay_dataclass(config.network, raw["network"])
+        if isinstance(raw.get("maintenance"), dict):
+            _overlay_dataclass(config.maintenance, raw["maintenance"])
         if isinstance(raw.get("blacklist"), dict):
             _overlay_dataclass(config.blacklist, raw["blacklist"])
     return config

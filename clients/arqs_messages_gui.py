@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
+import time
+import traceback
 import tkinter as tk
+import uuid
 from dataclasses import dataclass
 
 from datetime import datetime, timedelta, timezone
@@ -22,7 +26,16 @@ LINKS_PATH = APP_DIR / "links.json"
 MESSAGES_PATH = APP_DIR / "messages.jsonl"
 SEEN_DELIVERIES_PATH = APP_DIR / "seen_deliveries.json"
 PENDING_CODES_PATH = APP_DIR / "pending_link_codes.json"
+SESSION_LOG_PATH = APP_DIR / "pingback_session.jsonl"
 LOCAL_LINK_CODE_TTL_SECONDS = 15 * 60
+PING_HEADER_NAME = "x-arqs-ping"
+PING_HEADER_VALUE = "1"
+PING_DELAY_DATA_KEY = "local_pingback_delay_seconds"
+PING_CHAIN_DATA_KEY = "ping_chain_id"
+PING_NUMBER_DATA_KEY = "ping_number"
+PING_SENT_AT_DATA_KEY = "ping_sent_at_utc"
+PING_REPLY_TO_PACKET_DATA_KEY = "reply_to_packet_id"
+PING_MESSAGE_PATTERN = re.compile(r"^\s*ping\s+(\d+)\s*$", re.IGNORECASE)
 display_timezone = False
 
 
@@ -35,6 +48,8 @@ DEFAULT_CONFIG = {
     "local_endpoint_aliases": {},
     "window_geometry": "1180x760",
     "last_selected_conversation": None,
+    "enable_pingback": False,
+    "pingback_delay_seconds": "0",
 }
 
 
@@ -94,8 +109,18 @@ class App:
         self.poll_stop = threading.Event()
         self.poll_thread: threading.Thread | None = None
         self.busy_count = 0
+        self.session_id = uuid.uuid4().hex
+        self.session_log_lock = threading.Lock()
+        self.pending_ping_measurements: dict[tuple[str, int, str, str], dict[str, Any]] = {}
 
         self._build_ui()
+        self._rotate_session_log()
+        self._log_event(
+            "session_started",
+            log_path=str(SESSION_LOG_PATH),
+            enable_pingback=bool(self.config.get("enable_pingback", False)),
+            pingback_delay_seconds=str(self.config.get("pingback_delay_seconds", "0")),
+        )
         self._refresh_client_from_disk()
         self._refresh_conversations()
         self._restore_last_selection()
@@ -116,7 +141,7 @@ class App:
 
         top = ttk.Frame(self.root, padding=8)
         top.grid(row=0, column=0, sticky="nsew")
-        for col in range(10):
+        for col in range(12):
             top.columnconfigure(col, weight=0)
         top.columnconfigure(1, weight=1)
 
@@ -151,6 +176,18 @@ class App:
         self.poll_wait_var = tk.StringVar(value=str(self.config.get("poll_wait_seconds", 20)))
         ttk.Entry(top, textvariable=self.poll_wait_var, width=6).grid(row=1, column=5, sticky="w", pady=(8, 0))
         ttk.Label(top, text="sec").grid(row=1, column=6, sticky="w", pady=(8, 0))
+
+        self.enable_pingback_var = tk.BooleanVar(value=bool(self.config.get("enable_pingback", False)))
+        ttk.Checkbutton(
+            top,
+            text="Enable pingback",
+            variable=self.enable_pingback_var,
+            command=self._on_pingback_settings_changed,
+        ).grid(row=1, column=7, padx=(10, 2), pady=(8, 0), sticky="w")
+        ttk.Label(top, text="Pingback delay").grid(row=1, column=8, sticky="e", pady=(8, 0))
+        self.pingback_delay_var = tk.StringVar(value=str(self.config.get("pingback_delay_seconds", "0")))
+        ttk.Entry(top, textvariable=self.pingback_delay_var, width=8).grid(row=1, column=9, sticky="w", pady=(8, 0))
+        ttk.Label(top, text="sec").grid(row=1, column=10, sticky="w", pady=(8, 0))
 
         ttk.Label(top, text="Status").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.status_var = tk.StringVar(value="Ready.")
@@ -215,6 +252,7 @@ class App:
         self.message_entry.grid(row=0, column=0, sticky="ew")
         self.message_entry.bind("<Control-Return>", lambda _event: self.send_message())
         ttk.Button(compose, text="Send", command=self.send_message).grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        ttk.Button(compose, text="Send Ping", command=self.send_ping).grid(row=0, column=2, sticky="ns", padx=(8, 0))
 
     # --------------------------
     # Persistence helpers
@@ -249,10 +287,266 @@ class App:
         with MESSAGES_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
+    def _rotate_session_log(self) -> None:
+        SESSION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if SESSION_LOG_PATH.exists():
+            mtime = datetime.fromtimestamp(SESSION_LOG_PATH.stat().st_mtime, tz=timezone.utc)
+            suffix = mtime.strftime("%Y%m%dT%H%M%SZ")
+            rotated = SESSION_LOG_PATH.with_name(f"{SESSION_LOG_PATH.stem}_{suffix}{SESSION_LOG_PATH.suffix}")
+            counter = 2
+            while rotated.exists():
+                rotated = SESSION_LOG_PATH.with_name(
+                    f"{SESSION_LOG_PATH.stem}_{suffix}_{counter}{SESSION_LOG_PATH.suffix}"
+                )
+                counter += 1
+            SESSION_LOG_PATH.rename(rotated)
+        SESSION_LOG_PATH.write_text("", encoding="utf-8")
+
+    def _log_event(self, event_type: str, **payload: Any) -> None:
+        base_url = self.base_url_var.get().strip() if hasattr(self, "base_url_var") else str(self.config.get("base_url", ""))
+        node_id = None
+        if self.client is not None and self.client.identity is not None:
+            node_id = str(self.client.identity.node_id)
+        record = {
+            "event": event_type,
+            "logged_at": self._now_iso(),
+            "session_id": self.session_id,
+            "app": APP_NAME,
+            "base_url": base_url,
+            "node_id": node_id,
+            **payload,
+        }
+        with self.session_log_lock:
+            with SESSION_LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _format_exception_trace(self, exc: BaseException) -> str:
+        return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+    def _log_exception_event(self, event_type: str, exc: BaseException, **payload: Any) -> None:
+        self._log_event(
+            event_type,
+            error_type=exc.__class__.__name__,
+            message=str(exc),
+            traceback=self._format_exception_trace(exc),
+            **payload,
+        )
+
+    def _callback_name(self, callback: Any) -> str:
+        return str(getattr(callback, "__name__", callback.__class__.__name__))
+
+    def _on_pingback_settings_changed(self) -> None:
+        self._save_config()
+        self._log_event(
+            "pingback_settings_changed",
+            enable_pingback=bool(self.enable_pingback_var.get()),
+            pingback_delay_seconds=self.pingback_delay_var.get().strip(),
+        )
+
+    def _get_pingback_delay_seconds(self) -> float:
+        raw = self.pingback_delay_var.get().strip() if hasattr(self, "pingback_delay_var") else str(
+            self.config.get("pingback_delay_seconds", "0")
+        )
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        return max(0.0, value)
+
+    def _parse_ping_number(self, body: str | None) -> int | None:
+        if not body:
+            return None
+        match = PING_MESSAGE_PATTERN.match(str(body))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    def _is_ping_marker(self, headers: dict[str, Any] | None) -> bool:
+        for key, value in dict(headers or {}).items():
+            if str(key).strip().lower() == PING_HEADER_NAME and str(value).strip().lower() in {"1", "true", "yes", "ping"}:
+                return True
+        return False
+
+    def _is_ping_packet(self, *, headers: dict[str, Any] | None, body: str | None) -> bool:
+        return self._is_ping_marker(headers) and self._parse_ping_number(body) is not None
+
+    def _build_ping_payload(
+        self,
+        *,
+        ping_number: int,
+        chain_id: str | None = None,
+        reply_to_packet_id: str | None = None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        delay_seconds = self._get_pingback_delay_seconds()
+        data = {
+            "message_kind": "gui_ping",
+            PING_NUMBER_DATA_KEY: int(ping_number),
+            PING_CHAIN_DATA_KEY: str(chain_id or uuid.uuid4().hex),
+            PING_DELAY_DATA_KEY: delay_seconds,
+            PING_SENT_AT_DATA_KEY: self._now_iso(),
+        }
+        if reply_to_packet_id:
+            data[PING_REPLY_TO_PACKET_DATA_KEY] = str(reply_to_packet_id)
+        headers = {
+            "content_type": "text/plain",
+            PING_HEADER_NAME: PING_HEADER_VALUE,
+        }
+        meta = {
+            "client": APP_NAME,
+            "message_kind": "gui_ping",
+        }
+        return f"ping {int(ping_number)}", data, headers, meta
+
+    def _remember_outgoing_ping(
+        self,
+        *,
+        packet_id: str,
+        local_endpoint_id: str,
+        remote_endpoint_id: str,
+        body: str,
+        data: dict[str, Any] | None,
+        sent_at: str,
+        source: str,
+    ) -> None:
+        payload = dict(data or {})
+        chain_id = str(payload.get(PING_CHAIN_DATA_KEY) or "")
+        ping_number = self._parse_ping_number(body)
+        if not chain_id or ping_number is None:
+            return
+        self.pending_ping_measurements[(chain_id, ping_number + 1, local_endpoint_id, remote_endpoint_id)] = {
+            "packet_id": packet_id,
+            "sent_at": sent_at,
+            "local_endpoint_id": local_endpoint_id,
+            "remote_endpoint_id": remote_endpoint_id,
+            "outgoing_ping_number": ping_number,
+            "source": source,
+            "local_pingback_delay_seconds": payload.get(PING_DELAY_DATA_KEY),
+        }
+
+    def _log_ping_measurement(self, item: dict[str, Any]) -> None:
+        payload = dict(item.get("data") or {})
+        chain_id = str(payload.get(PING_CHAIN_DATA_KEY) or "")
+        ping_number = self._parse_ping_number(str(item.get("body") or ""))
+        if not chain_id or ping_number is None:
+            return
+        local_endpoint_id = str(item.get("local_endpoint_id") or "")
+        remote_endpoint_id = str(item.get("remote_endpoint_id") or "")
+        pending = self.pending_ping_measurements.pop(
+            (chain_id, ping_number, local_endpoint_id, remote_endpoint_id),
+            None,
+        )
+        if pending is None:
+            return
+
+        sent_at = self._parse_message_dt(pending.get("sent_at"))
+        received_at = self._parse_message_dt(item.get("received_at"))
+        raw_rtt_ms = max(0.0, (received_at - sent_at).total_seconds() * 1000.0)
+
+        remote_delay_seconds = payload.get(PING_DELAY_DATA_KEY)
+        adjusted_rtt_ms: float | None = None
+        if remote_delay_seconds not in (None, ""):
+            try:
+                adjusted_rtt_ms = max(0.0, raw_rtt_ms - (float(remote_delay_seconds) * 1000.0))
+            except (TypeError, ValueError):
+                adjusted_rtt_ms = None
+
+        measurement = {
+            "chain_id": chain_id,
+            "local_endpoint_id": local_endpoint_id,
+            "remote_endpoint_id": remote_endpoint_id,
+            "outgoing_ping_number": pending["outgoing_ping_number"],
+            "incoming_ping_number": ping_number,
+            "outgoing_packet_id": pending["packet_id"],
+            "incoming_packet_id": str(item.get("packet_id") or ""),
+            "raw_rtt_ms": raw_rtt_ms,
+            "adjusted_rtt_ms": adjusted_rtt_ms,
+            "remote_advertised_delay_seconds": remote_delay_seconds,
+            "sent_at": pending["sent_at"],
+            "received_at": item.get("received_at"),
+            "source": pending.get("source"),
+        }
+        self._log_event("ping_measurement", **measurement)
+        if adjusted_rtt_ms is not None:
+            self.ui_queue.put(("status", f"Ping RTT {raw_rtt_ms:.1f} ms (adjusted {adjusted_rtt_ms:.1f} ms)."))
+        else:
+            self.ui_queue.put(("status", f"Ping RTT {raw_rtt_ms:.1f} ms."))
+
+    def _finalize_sent_packet(
+        self,
+        *,
+        local_endpoint_id: str,
+        remote_endpoint_id: str,
+        body: str,
+        data: dict[str, Any] | None,
+        headers: dict[str, Any] | None,
+        meta: dict[str, Any] | None,
+        result: dict[str, Any],
+        source: str,
+        clear_message_entry: bool = False,
+        status_text: str | None = None,
+    ) -> None:
+        sent_at = str(result.get("sent_at") or self._now_iso())
+        message_item = {
+            "packet_id": result["packet_id"],
+            "delivery_id": result["delivery_id"],
+            "direction": "outgoing",
+            "local_endpoint_id": local_endpoint_id,
+            "remote_endpoint_id": remote_endpoint_id,
+            "body": body,
+            "data": data or {},
+            "headers": headers or {},
+            "meta": meta or {},
+            "created_at": sent_at,
+            "received_at": None,
+            "delivery_state": result["result"],
+            "source": source,
+        }
+        self._append_message(message_item)
+        record = self._get_link_record(local_endpoint_id, remote_endpoint_id)
+        if record is not None:
+            record["updated_at"] = sent_at
+            self._save_links()
+        self._refresh_conversations()
+        if clear_message_entry:
+            self.message_entry.delete("1.0", tk.END)
+        if self._is_ping_packet(headers=headers, body=body):
+            self._remember_outgoing_ping(
+                packet_id=str(result["packet_id"]),
+                local_endpoint_id=local_endpoint_id,
+                remote_endpoint_id=remote_endpoint_id,
+                body=body,
+                data=data,
+                sent_at=sent_at,
+                source=source,
+            )
+        self._log_event(
+            "packet_sent",
+            source=source,
+            packet_id=result["packet_id"],
+            delivery_id=result["delivery_id"],
+            local_endpoint_id=local_endpoint_id,
+            remote_endpoint_id=remote_endpoint_id,
+            body=body,
+            data=data or {},
+            headers=headers or {},
+            meta=meta or {},
+            result=result["result"],
+            sent_at=sent_at,
+        )
+        if status_text:
+            self.set_status(status_text)
+
     def _save_config(self) -> None:
         self.config["base_url"] = self.base_url_var.get().strip()
         self.config["node_name"] = self.node_name_var.get().strip()
         self.config["active_polling"] = bool(self.active_poll_var.get())
+        self.config["enable_pingback"] = bool(self.enable_pingback_var.get()) if hasattr(self, "enable_pingback_var") else False
+        self.config["pingback_delay_seconds"] = (
+            self.pingback_delay_var.get().strip() if hasattr(self, "pingback_delay_var") else "0"
+        )
         self.config["last_selected_conversation"] = self.selected_conversation_key
         self.config["window_geometry"] = self.root.geometry()
         JsonStore.save_json(CONFIG_PATH, self.config)
@@ -777,48 +1071,86 @@ class App:
         body = self.message_entry.get("1.0", tk.END).strip()
         if not body:
             return
+        headers = {"content_type": "text/plain"}
+        meta = {"client": APP_NAME}
 
         def job() -> dict[str, Any]:
+            sent_at = self._now_iso()
             result = client.send_packet(
                 from_endpoint_id=convo.local_endpoint_id,
                 to_endpoint_id=convo.remote_endpoint_id,
                 body=body,
                 data=None,
-                headers={"content_type": "text/plain"},
-                meta={"client": APP_NAME},
+                headers=headers,
+                meta=meta,
             )
             return {
                 "packet_id": str(result.packet_id),
                 "delivery_id": str(result.delivery_id) if result.delivery_id else None,
                 "expires_at": result.expires_at.isoformat() if result.expires_at else None,
                 "result": result.result,
+                "sent_at": sent_at,
             }
 
         def done(result: dict[str, Any]) -> None:
-            self.message_entry.delete("1.0", tk.END)
-            now = self._now_iso()
-            self._append_message(
-                {
-                    "packet_id": result["packet_id"],
-                    "delivery_id": result["delivery_id"],
-                    "direction": "outgoing",
-                    "local_endpoint_id": convo.local_endpoint_id,
-                    "remote_endpoint_id": convo.remote_endpoint_id,
-                    "body": body,
-                    "data": {},
-                    "created_at": now,
-                    "received_at": None,
-                    "delivery_state": result["result"],
-                }
+            self._finalize_sent_packet(
+                local_endpoint_id=convo.local_endpoint_id,
+                remote_endpoint_id=convo.remote_endpoint_id,
+                body=body,
+                data={},
+                headers=headers,
+                meta=meta,
+                result=result,
+                source="manual_message",
+                clear_message_entry=True,
+                status_text=f"Message sent ({result['result']}).",
             )
-            record = self._get_link_record(convo.local_endpoint_id, convo.remote_endpoint_id)
-            if record is not None:
-                record["updated_at"] = now
-                self._save_links()
-            self._refresh_conversations()
-            self.set_status(f"Message sent ({result['result']}).")
 
         self.run_bg(job, on_success=done, label="Sending message")
+
+    def send_ping(self) -> None:
+        client = self.require_client()
+        if client is None:
+            return
+        convo = self.get_selected_conversation()
+        if convo is None:
+            messagebox.showerror(APP_NAME, "Select a conversation first.")
+            return
+
+        body, data, headers, meta = self._build_ping_payload(ping_number=1)
+
+        def job() -> dict[str, Any]:
+            sent_at = self._now_iso()
+            result = client.send_packet(
+                from_endpoint_id=convo.local_endpoint_id,
+                to_endpoint_id=convo.remote_endpoint_id,
+                body=body,
+                data=data,
+                headers=headers,
+                meta=meta,
+            )
+            return {
+                "packet_id": str(result.packet_id),
+                "delivery_id": str(result.delivery_id) if result.delivery_id else None,
+                "expires_at": result.expires_at.isoformat() if result.expires_at else None,
+                "result": result.result,
+                "sent_at": sent_at,
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            self._finalize_sent_packet(
+                local_endpoint_id=convo.local_endpoint_id,
+                remote_endpoint_id=convo.remote_endpoint_id,
+                body=body,
+                data=data,
+                headers=headers,
+                meta=meta,
+                result=result,
+                source="manual_ping",
+                status_text=f"Ping sent ({result['result']}).",
+            )
+
+        self.run_bg(job, on_success=done, label="Sending ping")
 
     def refresh_everything(self, *, background: bool = True) -> None:
         if self.client is None:
@@ -851,46 +1183,13 @@ class App:
         wait_seconds = self._get_poll_wait_seconds(default=20) if wait is None else max(0, int(wait))
 
         def job() -> list[dict[str, Any]]:
-            deliveries = client.poll_inbox(wait=wait_seconds, limit=100, request_timeout=wait_seconds + 10)
-            items: list[dict[str, Any]] = []
-            for delivery in deliveries:
-                packet = delivery.packet
-                item = {
-                    "delivery_id": str(delivery.delivery_id),
-                    "packet_id": str(packet.packet_id),
-                    "from_endpoint_id": str(packet.from_endpoint_id),
-                    "to_endpoint_id": str(packet.to_endpoint_id),
-                    "body": packet.body or "",
-                    "data": packet.data,
-                    "created_at": packet.created_at.isoformat(),
-                    "received_at": self._now_iso(),
-                }
-                items.append(item)
-            return items
+            return self._fetch_inbox_items_with_ack(client, wait_seconds=wait_seconds)
 
         def done(items: list[dict[str, Any]]) -> None:
             count = 0
             for item in items:
-                delivery_id = str(item["delivery_id"])
-                if delivery_id in self.seen_deliveries:
-                    continue
-                self.seen_deliveries.add(delivery_id)
-                self._append_message(
-                    {
-                        "delivery_id": delivery_id,
-                        "packet_id": str(item["packet_id"]),
-                        "direction": "incoming",
-                        "local_endpoint_id": str(item["to_endpoint_id"]),
-                        "remote_endpoint_id": str(item["from_endpoint_id"]),
-                        "body": item["body"],
-                        "data": item["data"],
-                        "created_at": item["created_at"],
-                        "received_at": item["received_at"],
-                    }
-                )
-                count += 1
-                self._ack_delivery_async(delivery_id)
-                self._ensure_message_link_stub(str(item["to_endpoint_id"]), str(item["from_endpoint_id"]))
+                if self._handle_incoming_message_item(item):
+                    count += 1
             if count:
                 self._save_seen_deliveries()
                 self._refresh_conversations()
@@ -903,6 +1202,130 @@ class App:
             self.run_bg(job, on_success=done, label="Polling inbox")
         else:
             done(job())
+
+    def _schedule_pingback_if_needed(self, message_item: dict[str, Any]) -> None:
+        if not bool(self.enable_pingback_var.get()):
+            return
+        body = str(message_item.get("body") or "")
+        headers = dict(message_item.get("headers") or {})
+        if not self._is_ping_packet(headers=headers, body=body):
+            return
+
+        ping_number = self._parse_ping_number(body)
+        if ping_number is None:
+            return
+        client = self.require_client(silent=True)
+        if client is None:
+            self._log_event(
+                "pingback_skipped",
+                reason="no_client",
+                packet_id=message_item.get("packet_id"),
+                body=body,
+            )
+            return
+
+        incoming_data = dict(message_item.get("data") or {})
+        chain_id = str(incoming_data.get(PING_CHAIN_DATA_KEY) or message_item.get("packet_id") or uuid.uuid4().hex)
+        reply_number = ping_number + 1
+        local_delay_seconds = self._get_pingback_delay_seconds()
+        body_out, data_out, headers_out, meta_out = self._build_ping_payload(
+            ping_number=reply_number,
+            chain_id=chain_id,
+            reply_to_packet_id=str(message_item.get("packet_id") or ""),
+        )
+
+        def job() -> dict[str, Any]:
+            if local_delay_seconds > 0:
+                time.sleep(local_delay_seconds)
+            sent_at = self._now_iso()
+            result = client.send_packet(
+                from_endpoint_id=str(message_item["local_endpoint_id"]),
+                to_endpoint_id=str(message_item["remote_endpoint_id"]),
+                body=body_out,
+                data=data_out,
+                headers=headers_out,
+                meta=meta_out,
+            )
+            return {
+                "packet_id": str(result.packet_id),
+                "delivery_id": str(result.delivery_id) if result.delivery_id else None,
+                "expires_at": result.expires_at.isoformat() if result.expires_at else None,
+                "result": result.result,
+                "sent_at": sent_at,
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            self._finalize_sent_packet(
+                local_endpoint_id=str(message_item["local_endpoint_id"]),
+                remote_endpoint_id=str(message_item["remote_endpoint_id"]),
+                body=body_out,
+                data=data_out,
+                headers=headers_out,
+                meta=meta_out,
+                result=result,
+                source="auto_pingback",
+                status_text=f"Auto pingback sent ({result['result']}) as ping {reply_number}.",
+            )
+
+        def on_error(exc: Exception) -> None:
+            self._log_event(
+                "pingback_send_error",
+                packet_id=message_item.get("packet_id"),
+                reply_number=reply_number,
+                error=str(exc),
+            )
+            self._handle_error(exc, popup=False)
+
+        self._log_event(
+            "pingback_scheduled",
+            packet_id=message_item.get("packet_id"),
+            incoming_ping_number=ping_number,
+            reply_ping_number=reply_number,
+            local_delay_seconds=local_delay_seconds,
+            chain_id=chain_id,
+        )
+        self.run_bg_quiet(job, on_success=done, on_error=on_error, label="Auto pingback")
+
+    def _handle_incoming_message_item(self, item: dict[str, Any]) -> bool:
+        delivery_id = str(item["delivery_id"])
+        if delivery_id in self.seen_deliveries:
+            return False
+
+        self.seen_deliveries.add(delivery_id)
+        message_item = {
+            "delivery_id": delivery_id,
+            "packet_id": str(item["packet_id"]),
+            "direction": "incoming",
+            "local_endpoint_id": str(item["to_endpoint_id"]),
+            "remote_endpoint_id": str(item["from_endpoint_id"]),
+            "body": item["body"],
+            "data": item.get("data") or {},
+            "headers": item.get("headers") or {},
+            "meta": item.get("meta") or {},
+            "created_at": item["created_at"],
+            "received_at": item["received_at"],
+        }
+        self._append_message(message_item)
+        self._log_event(
+            "packet_received",
+            delivery_id=delivery_id,
+            packet_id=message_item["packet_id"],
+            local_endpoint_id=message_item["local_endpoint_id"],
+            remote_endpoint_id=message_item["remote_endpoint_id"],
+            body=message_item["body"],
+            data=message_item["data"],
+            headers=message_item["headers"],
+            meta=message_item["meta"],
+            created_at=message_item["created_at"],
+            received_at=message_item["received_at"],
+            is_ping=self._is_ping_packet(headers=message_item["headers"], body=message_item["body"]),
+            ping_number=self._parse_ping_number(message_item["body"]),
+            remote_advertised_delay_seconds=(message_item.get("data") or {}).get(PING_DELAY_DATA_KEY),
+        )
+        self._ensure_message_link_stub(str(item["to_endpoint_id"]), str(item["from_endpoint_id"]))
+        self._log_ping_measurement(message_item)
+        self._schedule_pingback_if_needed(message_item)
+        return True
 
     def toggle_active_polling(self) -> None:
         enabled = bool(self.active_poll_var.get())
@@ -938,24 +1361,47 @@ class App:
                 continue
             wait_seconds = self._get_poll_wait_seconds(default=20)
             try:
-                deliveries = client.poll_inbox(wait=wait_seconds, limit=100, request_timeout=wait_seconds + 10)
-                self.ui_queue.put(("poll_result", deliveries))
+                items = self._fetch_inbox_items_with_ack(client, wait_seconds=wait_seconds)
+                self.ui_queue.put(("poll_result", items))
             except Exception as exc:
                 self.ui_queue.put(("poll_error", exc))
                 self.poll_stop.wait(3.0)
 
-    def _ack_delivery_async(self, delivery_id: str) -> None:
-        client = self.client
-        if client is None:
-            return
+    def _fetch_inbox_items_with_ack(self, client: ARQSClient, *, wait_seconds: int) -> list[dict[str, Any]]:
+        deliveries = client.poll_inbox(wait=wait_seconds, limit=100, request_timeout=wait_seconds + 10)
+        items: list[dict[str, Any]] = []
+        for delivery in deliveries:
+            packet = delivery.packet
+            delivery_id = str(delivery.delivery_id)
+            item = {
+                "delivery_id": delivery_id,
+                "packet_id": str(packet.packet_id),
+                "from_endpoint_id": str(packet.from_endpoint_id),
+                "to_endpoint_id": str(packet.to_endpoint_id),
+                "body": packet.body or "",
+                "data": packet.data,
+                "headers": packet.headers,
+                "meta": packet.meta,
+                "created_at": packet.created_at.isoformat(),
+                "received_at": self._now_iso(),
+            }
+            self._ack_delivery_now(client, delivery_id)
+            items.append(item)
+        return items
 
-        def worker() -> None:
-            try:
-                client.ack_delivery(delivery_id, status="handled")
-            except Exception:
-                return
-
-        threading.Thread(target=worker, name=f"ack-{delivery_id}", daemon=True).start()
+    def _ack_delivery_now(self, client: ARQSClient, delivery_id: str) -> bool:
+        try:
+            client.ack_delivery(delivery_id, status="handled")
+            self._log_event("delivery_acked", delivery_id=delivery_id, status="handled", ack_mode="inline")
+            return True
+        except Exception as exc:
+            self._log_event(
+                "delivery_ack_error",
+                delivery_id=delivery_id,
+                error=str(exc),
+                ack_mode="inline",
+            )
+            return False
 
     def _ensure_message_link_stub(self, local_endpoint_id: str, remote_endpoint_id: str) -> None:
         if self._get_link_record(local_endpoint_id, remote_endpoint_id) is not None:
@@ -1166,55 +1612,74 @@ class App:
 
         threading.Thread(target=runner, name=label.replace(" ", "-"), daemon=True).start()
 
-    def _process_ui_queue(self) -> None:
-        while True:
+    def run_bg_quiet(self, func: Any, *, on_success: Any | None = None, on_error: Any | None = None, label: str) -> None:
+        def runner() -> None:
             try:
-                item = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            kind = item[0]
-            if kind == "busy":
-                self.busy_count += 1
-                self.set_status(f"{item[1]}...")
-            elif kind == "idle":
-                self.busy_count = max(0, self.busy_count - 1)
-            elif kind == "error":
-                self._handle_error(item[1])
-            elif kind == "success":
-                callback, result = item[1], item[2]
-                callback(result)
-            elif kind == "poll_result":
-                deliveries = item[1]
-                self._handle_poll_deliveries(deliveries)
-            elif kind == "poll_error":
-                self._handle_error(item[1], popup=False)
-        self.root.after(100, self._process_ui_queue)
+                result = func()
+            except Exception as exc:
+                if on_error is not None:
+                    self.ui_queue.put(("quiet_error", on_error, exc))
+            else:
+                if on_success is not None:
+                    self.ui_queue.put(("success", on_success, result))
 
-    def _handle_poll_deliveries(self, deliveries: list[Any]) -> None:
+        threading.Thread(target=runner, name=label.replace(" ", "-"), daemon=True).start()
+
+    def _process_ui_queue(self) -> None:
+        try:
+            while True:
+                try:
+                    item = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                kind = None
+                try:
+                    kind = item[0]
+                    if kind == "busy":
+                        self.busy_count += 1
+                        self.set_status(f"{item[1]}...")
+                    elif kind == "idle":
+                        self.busy_count = max(0, self.busy_count - 1)
+                    elif kind == "error":
+                        self._handle_error(item[1])
+                    elif kind == "success":
+                        callback, result = item[1], item[2]
+                        callback(result)
+                    elif kind == "quiet_error":
+                        callback, exc = item[1], item[2]
+                        callback(exc)
+                    elif kind == "poll_result":
+                        deliveries = item[1]
+                        self._handle_poll_deliveries(deliveries)
+                    elif kind == "poll_error":
+                        self._handle_error(item[1], popup=False)
+                    elif kind == "status":
+                        self.set_status(str(item[1]))
+                    else:
+                        self._log_event("ui_queue_unknown_item", queue_kind=str(kind), queue_item_repr=repr(item))
+                except Exception as exc:
+                    payload: dict[str, Any] = {
+                        "queue_kind": str(kind) if kind is not None else None,
+                        "queue_item_repr": repr(item),
+                    }
+                    if kind in ("success", "quiet_error") and len(item) > 1:
+                        payload["callback_name"] = self._callback_name(item[1])
+                    self._log_exception_event("ui_queue_processing_error", exc, **payload)
+                    try:
+                        self.status_var.set(f"UI queue error: {exc.__class__.__name__}: {exc}")
+                    except Exception:
+                        pass
+        finally:
+            try:
+                self.root.after(100, self._process_ui_queue)
+            except Exception as exc:
+                self._log_exception_event("ui_queue_reschedule_error", exc)
+
+    def _handle_poll_deliveries(self, items: list[dict[str, Any]]) -> None:
         count = 0
-        for delivery in deliveries:
-            delivery_id = str(delivery.delivery_id)
-            if delivery_id in self.seen_deliveries:
-                self._ack_delivery_async(delivery_id)
-                continue
-            self.seen_deliveries.add(delivery_id)
-            packet = delivery.packet
-            self._append_message(
-                {
-                    "delivery_id": delivery_id,
-                    "packet_id": str(packet.packet_id),
-                    "direction": "incoming",
-                    "local_endpoint_id": str(packet.to_endpoint_id),
-                    "remote_endpoint_id": str(packet.from_endpoint_id),
-                    "body": packet.body or "",
-                    "data": packet.data,
-                    "created_at": packet.created_at.isoformat(),
-                    "received_at": self._now_iso(),
-                }
-            )
-            self._ack_delivery_async(delivery_id)
-            self._ensure_message_link_stub(str(packet.to_endpoint_id), str(packet.from_endpoint_id))
-            count += 1
+        for item in items:
+            if self._handle_incoming_message_item(item):
+                count += 1
         if count:
             self._save_seen_deliveries()
             self._refresh_conversations()
@@ -1226,6 +1691,13 @@ class App:
             message = f"HTTP {exc.status_code}: {exc.detail}"
         else:
             message = str(exc)
+        self._log_event(
+            "gui_error",
+            popup=popup,
+            error_type=exc.__class__.__name__,
+            message=message,
+            traceback=self._format_exception_trace(exc),
+        )
         self.set_status(message)
         if popup:
             messagebox.showerror(APP_NAME, message)
@@ -1319,6 +1791,11 @@ class App:
         self._save_config()
 
     def on_close(self) -> None:
+        self._log_event(
+            "session_closed",
+            enable_pingback=bool(self.enable_pingback_var.get()),
+            pingback_delay_seconds=self.pingback_delay_var.get().strip(),
+        )
         self._stop_poll_thread()
         self._save_config()
         self.root.destroy()

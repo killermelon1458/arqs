@@ -110,3 +110,6 @@ zip_archive
 clients/arqs_messages_gui_2.py
 tests/testing.md
 ARQS_Testing.md
+tests/multi_machine_tests
+arqs-server/INBOX_READ_ONLY_PATCH_PLAN.md
+clients/arqs_messages_gui_*.py

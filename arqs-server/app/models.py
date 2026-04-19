@@ -88,6 +88,7 @@ class Packet(Base):
     __table_args__ = (
         Index("ix_packets_to_endpoint_id", "to_endpoint_id"),
         Index("ix_packets_sender_node_id", "sender_node_id"),
+        Index("ix_packets_expires_at", "expires_at"),
     )
 
     packet_id: Mapped[str] = mapped_column(String(36), primary_key=True)
