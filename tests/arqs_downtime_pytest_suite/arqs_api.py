@@ -3,9 +3,9 @@ from __future__ import annotations
 """
 ARQS scripting API client.
 
-This file is intentionally aligned to the API actually implemented in
-`arqs-server-v0.1.0.zip` and the transport model described in
-`ARQS_Server_Plan.md`.
+This file is intended to track the ARQS server implementation that
+currently exists in this repository. It is a low-level transport client,
+not a frozen spec snapshot.
 
 Design choices in this client:
 - node-centric auth with one API key per node
@@ -17,7 +17,7 @@ Design choices in this client:
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib import error as urllib_error
@@ -29,6 +29,9 @@ import uuid
 
 LinkMode = Literal["bidirectional", "a_to_b", "b_to_a"]
 AckStatus = Literal["received", "handled", "rejected", "failed", "invalid", "unsupported"]
+
+DEFAULT_API_KEY_HEADER = "X-ARQS-API-Key"
+AUTHORIZATION_HEADER = "Authorization"
 
 
 class ARQSError(Exception):
@@ -203,13 +206,13 @@ class ARQSClient:
         *,
         api_key: str | None = None,
         timeout: float = 30.0,
-        api_key_header: str = "X-ARQS-API-Key",
+        api_key_header: str = DEFAULT_API_KEY_HEADER,
         user_agent: str = "arqs_api.py/1.0",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = float(timeout)
-        self.api_key_header = api_key_header
+        self.api_key_header = _normalize_api_key_header(api_key_header)
         self.user_agent = user_agent
         self.identity: NodeIdentity | None = None
 
@@ -220,7 +223,7 @@ class ARQSClient:
         identity_path: str | Path,
         *,
         timeout: float = 30.0,
-        api_key_header: str = "X-ARQS-API-Key",
+        api_key_header: str = DEFAULT_API_KEY_HEADER,
         user_agent: str = "arqs_api.py/1.0",
     ) -> "ARQSClient":
         identity = NodeIdentity.load(identity_path)
@@ -448,7 +451,13 @@ class ARQSClient:
         if require_auth:
             if not self.api_key:
                 raise ARQSError("this request requires an API key, but no API key is set")
-            headers[self.api_key_header] = self.api_key
+            if self.api_key_header == AUTHORIZATION_HEADER:
+                token = self.api_key.strip()
+                if token.lower().startswith("bearer "):
+                    token = token[7:].strip()
+                headers[self.api_key_header] = f"Bearer {token}"
+            else:
+                headers[self.api_key_header] = self.api_key
 
         req = urllib_request.Request(url=url, data=body_bytes, headers=headers, method=method.upper())
         try:
@@ -491,6 +500,16 @@ def _stringify_id(value: str | uuid.UUID) -> str:
     return str(value)
 
 
+def _normalize_api_key_header(value: str) -> str:
+    header = str(value or "").strip()
+    lowered = header.lower()
+    if lowered == DEFAULT_API_KEY_HEADER.lower():
+        return DEFAULT_API_KEY_HEADER
+    if lowered == AUTHORIZATION_HEADER.lower():
+        return AUTHORIZATION_HEADER
+    raise ValueError("api_key_header must be 'X-ARQS-API-Key' or 'Authorization'")
+
+
 def _parse_uuid(value: Any) -> uuid.UUID:
     return uuid.UUID(str(value))
 
@@ -502,7 +521,10 @@ def _parse_uuid_or_none(value: Any) -> uuid.UUID | None:
 
 
 def _parse_datetime(value: Any) -> datetime:
-    return datetime.fromisoformat(str(value))
+    dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _parse_datetime_or_none(value: Any) -> datetime | None:

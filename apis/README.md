@@ -57,10 +57,16 @@ ARQS uses one API key per node.
 By default, the client sends it in:
 
 ```text
-X-ARQS-API-Key
+X-ARQS-API-Key: <node-api-key>
 ```
 
-You can override the header name when constructing the client if your server config changed it.
+The current server also accepts:
+
+```text
+Authorization: Bearer <node-api-key>
+```
+
+You can choose between those two server-supported auth modes by constructing the client with the default `api_key_header="X-ARQS-API-Key"` or with `api_key_header="Authorization"`. Arbitrary custom header names are not supported by the current server auth path.
 
 ## Core types
 

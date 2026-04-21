@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import queue
 import re
+import sys
 import threading
 import time
 import traceback
@@ -15,6 +16,16 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
+
+# Resolve `arqs_api` by script location so the GUI works with a local copy,
+# the repo-shared `/apis` copy, or an installed module.
+SCRIPT_DIR = Path(__file__).resolve().parent
+for _candidate in (SCRIPT_DIR, SCRIPT_DIR.parent / "apis"):
+    if (_candidate / "arqs_api.py").is_file():
+        candidate_str = str(_candidate)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+        break
 
 from arqs_api import ARQSClient, ARQSHTTPError, Endpoint, Link, LinkCode
 

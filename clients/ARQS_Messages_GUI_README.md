@@ -1,9 +1,9 @@
 # ARQS Messages GUI
 
-This bundle contains:
+This client uses:
 
 - `arqs_messages_gui.py` — Tkinter desktop client
-- `arqs_api.py` — the uploaded ARQS Python API the GUI wraps
+- `arqs_api.py` — loaded from the script directory, the repo's `../apis` folder, or an installed module
 
 ## What it does
 
@@ -35,6 +35,6 @@ python arqs_messages_gui.py
 
 ## Notes
 
-- Put both Python files in the same folder.
+- The GUI looks for `arqs_api.py` next to the script first, then in `../apis`, then in installed modules.
 - The default endpoint created during registration is saved automatically.
 - Named endpoints are created through the API. Extra local aliases are stored in the GUI config.

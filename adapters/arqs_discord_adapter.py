@@ -50,6 +50,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+# Resolve `arqs_api` by script location so the adapter works with a local copy,
+# the repo-shared `/apis` copy, or an installed module.
+SCRIPT_DIR = Path(__file__).resolve().parent
+for _candidate in (SCRIPT_DIR, SCRIPT_DIR.parent / "apis"):
+    if (_candidate / "arqs_api.py").is_file():
+        candidate_str = str(_candidate)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+        break
+
 import discord
 from discord import app_commands
 from discord.ext import commands
