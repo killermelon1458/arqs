@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from .config import AppConfig
 from .db import get_config
 from .models import Delivery, DirectedRoute, Endpoint, Link, LinkCode, Node, Packet
+from .runtime_access_cache import mark_runtime_access_dirty
 
 
 RUNTIME_SETTINGS_ID = 1
@@ -400,20 +401,19 @@ def ensure_admin_tables(db: Session, cfg: AppConfig | None = None, *, force: boo
                 ip TEXT PRIMARY KEY,
                 action TEXT NOT NULL,
                 reason TEXT NULL,
-                created_at DATETIME NOT NULL,
-                expires_at DATETIME NULL
+                created_at DATETIME NOT NULL
             )
             """
         )
     )
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_ip_access_rules_action ON ip_access_rules (action)"))
-    db.execute(text("CREATE INDEX IF NOT EXISTS ix_ip_access_rules_expires_at ON ip_access_rules (expires_at)"))
+    db.execute(text("DROP INDEX IF EXISTS ix_ip_access_rules_expires_at"))
 
     if _table_exists(db, "blocked_ips"):
         legacy_rows = db.execute(
             text(
                 """
-                SELECT ip, reason, created_at, expires_at
+                SELECT ip, reason, created_at
                 FROM blocked_ips
                 ORDER BY created_at ASC, ip ASC
                 """
@@ -432,28 +432,18 @@ def ensure_admin_tables(db: Session, cfg: AppConfig | None = None, *, force: boo
             db.execute(
                 text(
                     """
-                    INSERT INTO ip_access_rules (ip, action, reason, created_at, expires_at)
-                    VALUES (:ip, 'deny', :reason, :created_at, :expires_at)
+                    INSERT INTO ip_access_rules (ip, action, reason, created_at)
+                    VALUES (:ip, 'deny', :reason, :created_at)
                     """
                 ),
                 {
                     "ip": normalized_ip,
                     "reason": row["reason"],
                     "created_at": row["created_at"],
-                    "expires_at": row["expires_at"],
                 },
             )
 
     _ADMIN_TABLES_READY = True
-
-
-def prune_expired_ip_rules(db: Session) -> int:
-    _ensure_admin_tables(db)
-    result = db.execute(
-        text("DELETE FROM ip_access_rules WHERE expires_at IS NOT NULL AND expires_at <= :now"),
-        {"now": utcnow()},
-    )
-    return int(result.rowcount or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +485,7 @@ def update_runtime_settings(db: Session, **updates: Any) -> dict[str, Any]:
         text(f"UPDATE runtime_settings SET {assignments} WHERE settings_id = :settings_id"),
         filtered,
     )
+    mark_runtime_access_dirty(db)
     return _get_runtime_settings_row_safe(db)
 
 
@@ -526,7 +517,7 @@ def list_ip_rules(db: Session, *, action: str | None = None) -> list[dict[str, A
     rows = db.execute(
         text(
             """
-            SELECT ip, action, reason, created_at, expires_at
+            SELECT ip, action, reason, created_at
             FROM ip_access_rules
             """
             + where
@@ -546,7 +537,6 @@ def set_ip_rule(
     *,
     action: str,
     reason: str | None = None,
-    expires_at: datetime | None = None,
 ) -> dict[str, Any]:
     _ensure_admin_tables(db)
     normalized_ip = normalize_ip(ip)
@@ -555,13 +545,12 @@ def set_ip_rule(
     db.execute(
         text(
             """
-            INSERT INTO ip_access_rules (ip, action, reason, created_at, expires_at)
-            VALUES (:ip, :action, :reason, :created_at, :expires_at)
+            INSERT INTO ip_access_rules (ip, action, reason, created_at)
+            VALUES (:ip, :action, :reason, :created_at)
             ON CONFLICT(ip) DO UPDATE SET
                 action = excluded.action,
                 reason = excluded.reason,
-                created_at = excluded.created_at,
-                expires_at = excluded.expires_at
+                created_at = excluded.created_at
             """
         ),
         {
@@ -569,15 +558,14 @@ def set_ip_rule(
             "action": normalized_action,
             "reason": (reason.strip() if isinstance(reason, str) and reason.strip() else None),
             "created_at": now,
-            "expires_at": None,
         },
     )
+    mark_runtime_access_dirty(db)
     return {
         "ip": normalized_ip,
         "action": normalized_action,
         "reason": (reason.strip() if isinstance(reason, str) and reason.strip() else None),
         "created_at": now,
-        "expires_at": None,
     }
 
 
@@ -587,9 +575,8 @@ def allow_ip(
     ip: str,
     *,
     reason: str | None = None,
-    expires_at: datetime | None = None,
 ) -> dict[str, Any]:
-    result = set_ip_rule(db, ip, action="allow", reason=reason, expires_at=expires_at)
+    result = set_ip_rule(db, ip, action="allow", reason=reason)
     return {"allowed": True, **result}
 
 
@@ -598,9 +585,8 @@ def deny_ip(
     ip: str,
     *,
     reason: str | None = None,
-    expires_at: datetime | None = None,
 ) -> dict[str, Any]:
-    result = set_ip_rule(db, ip, action="deny", reason=reason, expires_at=expires_at)
+    result = set_ip_rule(db, ip, action="deny", reason=reason)
     return {"denied": True, **result}
 
 
@@ -610,6 +596,7 @@ def remove_ip_rule(db: Session, ip: str) -> dict[str, Any]:
     result = db.execute(text("DELETE FROM ip_access_rules WHERE ip = :ip"), {"ip": normalized_ip})
     if int(result.rowcount or 0) == 0:
         raise AdminNotFoundError(f"IP rule not found: {normalized_ip}")
+    mark_runtime_access_dirty(db)
     return {"removed": True, "ip": normalized_ip}
 
 
@@ -619,9 +606,8 @@ def block_ip(
     ip: str,
     *,
     reason: str | None = None,
-    expires_at: datetime | None = None,
 ) -> dict[str, Any]:
-    result = set_ip_rule(db, ip, action="deny", reason=reason, expires_at=expires_at)
+    result = set_ip_rule(db, ip, action="deny", reason=reason)
     return {"blocked": True, **result}
 
 
@@ -1105,7 +1091,6 @@ __all__ = [
     "AdminConflictError",
     "normalize_ip",
     "ensure_admin_tables",
-    "prune_expired_ip_rules",
     "get_runtime_settings",
     "update_runtime_settings",
     "get_ip_policy",

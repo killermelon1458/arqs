@@ -34,6 +34,20 @@ def _sqlite_pragmas(dbapi_connection, _connection_record):
 SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
+@event.listens_for(SessionLocal, "after_commit")
+def _touch_runtime_access_marker_after_commit(session):
+    if not session.info.pop("runtime_access_cache_dirty", False):
+        return
+    from .runtime_access_cache import touch_runtime_access_marker
+
+    touch_runtime_access_marker()
+
+
+@event.listens_for(SessionLocal, "after_rollback")
+def _clear_runtime_access_marker_flag_after_rollback(session):
+    session.info.pop("runtime_access_cache_dirty", None)
+
+
 def get_engine():
     return _engine
 

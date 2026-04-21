@@ -11,11 +11,26 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from .admin_services import ensure_admin_tables, get_runtime_settings, is_ip_allowed
-from .auth import generate_api_key, get_client_ip, hash_api_key, require_node
-from .db import get_config, get_db, init_db, session_scope
+from .admin_services import ensure_admin_tables, get_runtime_settings
+from .auth import (
+    AuthenticatedNodeContext,
+    generate_api_key,
+    get_client_ip,
+    hash_api_key,
+    require_node,
+    require_node_context,
+)
+from .db import SessionLocal, get_config, get_db, init_db, session_scope
+from .inbox_notifier import InboxNotifier
 from .models import Delivery, DirectedRoute, Endpoint, Link, LinkCode, Node, Packet, SendEvent
+from .runtime_access_cache import (
+    get_inbox_limits_cached,
+    is_ip_allowed_cached,
+    start_runtime_access_cache_watcher,
+    stop_runtime_access_cache_watcher,
+)
 from .schemas import (
     DeleteIdentityResponse,
     EndpointCreateRequest,
@@ -58,9 +73,70 @@ from .services import (
 cfg = get_config()
 app = FastAPI(title=cfg.server.app_name, version="1.0.0")
 init_db()
-logger = logging.getLogger(__name__)
+
+
+def _build_app_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%SZ",
+        )
+        formatter.converter = time.gmtime
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
+logger = _build_app_logger("arqs.app")
+request_logger = _build_app_logger("arqs.request")
 _maintenance_stop_event = threading.Event()
 _maintenance_thread: threading.Thread | None = None
+inbox_notifier = InboxNotifier()
+
+
+def _request_log_level(status_code: int) -> int:
+    if status_code >= 500:
+        return logging.ERROR
+    if status_code >= 400:
+        return logging.WARNING
+    return logging.INFO
+
+
+def _log_request_event(
+    *,
+    message: str,
+    method: str,
+    path: str,
+    query: str,
+    status_code: int,
+    duration_ms: float,
+    direct_peer_ip: str,
+    direct_peer_port: int | None,
+    effective_client_ip: str,
+    node_id: str | None = None,
+    detail: str | None = None,
+    exc_info: bool = False,
+) -> None:
+    level = _request_log_level(status_code)
+    parts = [
+        message,
+        f"method={method}",
+        f"path={path}",
+        f"query={query or '-'}",
+        f"status={status_code}",
+        f"duration_ms={duration_ms:.2f}",
+        f"direct_peer_ip={direct_peer_ip}",
+        f"direct_peer_port={direct_peer_port if direct_peer_port is not None else '-'}",
+        f"effective_client_ip={effective_client_ip}",
+        f"node_id={node_id or '-'}",
+    ]
+    if detail:
+        parts.append(f"detail={detail}")
+    request_logger.log(level, " ".join(parts), exc_info=exc_info)
 
 
 def _maintenance_loop(stop_event: threading.Event) -> None:
@@ -75,12 +151,57 @@ def _maintenance_loop(stop_event: threading.Event) -> None:
             logger.exception("ARQS maintenance cleanup failed")
 
 
+def _load_inbox_limits() -> tuple[int, int]:
+    return get_inbox_limits_cached(cfg)
+
+
+def _fetch_inbox_deliveries(node_id: str, limit: int) -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(Delivery, Packet)
+            .join(Packet, Packet.packet_id == Delivery.packet_id)
+            .where(
+                Delivery.destination_node_id == node_id,
+                Delivery.state == "queued",
+                active_packet_clause(now=utcnow()),
+            )
+            .order_by(Delivery.queued_at.asc())
+            .limit(limit)
+        ).all()
+
+    results = []
+    for delivery, packet in rows:
+        results.append(
+            {
+                "delivery_id": delivery.delivery_id,
+                "destination_endpoint_id": delivery.destination_endpoint_id,
+                "queued_at": delivery.queued_at,
+                "state": delivery.state,
+                "last_attempt_at": delivery.last_attempt_at,
+                "packet": {
+                    "packet_id": packet.packet_id,
+                    "version": packet.version,
+                    "from_endpoint_id": packet.from_endpoint_id,
+                    "to_endpoint_id": packet.to_endpoint_id,
+                    "headers": packet.headers,
+                    "body": packet.body,
+                    "data": packet.data,
+                    "meta": packet.meta,
+                    "created_at": packet.created_at,
+                    "expires_at": packet.expires_at,
+                },
+            }
+        )
+    return results
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     global _maintenance_thread
     init_db()
     with session_scope() as db:
         ensure_admin_tables(db, cfg)
+    start_runtime_access_cache_watcher(cfg)
     _maintenance_stop_event.clear()
     interval = int(cfg.maintenance.cleanup_interval_seconds)
     if interval > 0 and (_maintenance_thread is None or not _maintenance_thread.is_alive()):
@@ -100,22 +221,70 @@ def on_shutdown() -> None:
     if _maintenance_thread is not None and _maintenance_thread.is_alive():
         _maintenance_thread.join(timeout=2.0)
     _maintenance_thread = None
+    stop_runtime_access_cache_watcher()
 
 
 @app.middleware("http")
 async def enforce_ip_policy_and_no_store(request: Request, call_next):
+    started = time.perf_counter()
+    direct_peer_ip = request.client.host if request.client else "unknown"
+    direct_peer_port = request.client.port if request.client else None
     client_ip = get_client_ip(request)
-    with session_scope() as db:
-        if not is_ip_allowed(db, client_ip, cfg=cfg):
-            response = JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content={"detail": "client IP denied"},
-            )
-            response.headers["Cache-Control"] = "no-store"
-            return response
+    method = request.method
+    path = request.url.path
+    query = request.url.query
+    if not is_ip_allowed_cached(client_ip, cfg=cfg):
+        response = JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": "client IP denied"},
+        )
+        response.headers["Cache-Control"] = "no-store"
+        _log_request_event(
+            message="request_denied",
+            method=method,
+            path=path,
+            query=query,
+            status_code=response.status_code,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            direct_peer_ip=direct_peer_ip,
+            direct_peer_port=direct_peer_port,
+            effective_client_ip=client_ip,
+            detail="client IP denied",
+        )
+        return response
 
-    response: Response = await call_next(request)
+    try:
+        response: Response = await call_next(request)
+    except Exception as exc:
+        _log_request_event(
+            message="request_exception",
+            method=method,
+            path=path,
+            query=query,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            direct_peer_ip=direct_peer_ip,
+            direct_peer_port=direct_peer_port,
+            effective_client_ip=client_ip,
+            node_id=getattr(request.state, "node_id", None),
+            detail=type(exc).__name__,
+            exc_info=True,
+        )
+        raise
+
     response.headers["Cache-Control"] = "no-store"
+    _log_request_event(
+        message="request_complete",
+        method=method,
+        path=path,
+        query=query,
+        status_code=int(response.status_code),
+        duration_ms=(time.perf_counter() - started) * 1000.0,
+        direct_peer_ip=direct_peer_ip,
+        direct_peer_port=direct_peer_port,
+        effective_client_ip=client_ip,
+        node_id=getattr(request.state, "node_id", None),
+    )
     return response
 
 
@@ -565,6 +734,7 @@ def send_packet(
         db.flush()
         db.add(delivery)
         db.commit()
+        inbox_notifier.notify(dest_node.node_id)
         return PacketSendResponse(
             result="accepted",
             packet_id=packet.packet_id,
@@ -620,59 +790,32 @@ def send_packet(
         )
 
 @app.get("/inbox", response_model=InboxResponse)
-def poll_inbox(
-    node: Annotated[Node, Depends(require_node)],
-    db: Annotated[Session, Depends(get_db)],
+async def poll_inbox(
+    node: Annotated[AuthenticatedNodeContext, Depends(require_node_context)],
     wait: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1),
 ):
     ensure_node_active(node)
-    runtime_settings = get_runtime_settings(db)
-    wait = min(wait, int(runtime_settings["long_poll_max_seconds"]))
-    limit = min(limit, int(runtime_settings["max_inbox_batch"]))
+    max_wait, max_limit = _load_inbox_limits()
+    wait = min(wait, max_wait)
+    limit = min(limit, max_limit)
 
     deadline = time.monotonic() + wait
-    rows = []
     while True:
-        rows = db.execute(
-            select(Delivery, Packet)
-            .join(Packet, Packet.packet_id == Delivery.packet_id)
-            .where(
-                Delivery.destination_node_id == node.node_id,
-                Delivery.state == "queued",
-                active_packet_clause(now=utcnow()),
-            )
-            .order_by(Delivery.queued_at.asc())
-            .limit(limit)
-        ).all()
-        if rows or time.monotonic() >= deadline:
-            break
-        time.sleep(0.5)
+        inbox_version = inbox_notifier.snapshot(node.node_id)
+        deliveries = await run_in_threadpool(_fetch_inbox_deliveries, node.node_id, limit)
+        if deliveries or time.monotonic() >= deadline:
+            return InboxResponse(deliveries=deliveries)
 
-    results = []
-    for delivery, packet in rows:
-        results.append(
-            {
-                "delivery_id": delivery.delivery_id,
-                "destination_endpoint_id": delivery.destination_endpoint_id,
-                "queued_at": delivery.queued_at,
-                "state": delivery.state,
-                "last_attempt_at": delivery.last_attempt_at,
-                "packet": {
-                    "packet_id": packet.packet_id,
-                    "version": packet.version,
-                    "from_endpoint_id": packet.from_endpoint_id,
-                    "to_endpoint_id": packet.to_endpoint_id,
-                    "headers": packet.headers,
-                    "body": packet.body,
-                    "data": packet.data,
-                    "meta": packet.meta,
-                    "created_at": packet.created_at,
-                    "expires_at": packet.expires_at,
-                },
-            }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+
+        await inbox_notifier.wait_for_change(
+            node.node_id,
+            after_version=inbox_version,
+            timeout=remaining,
         )
-    return InboxResponse(deliveries=results)
 
 
 @app.post("/packet_ack", response_model=PacketAckResponse)

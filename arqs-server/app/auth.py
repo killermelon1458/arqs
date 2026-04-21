@@ -6,13 +6,14 @@ import hmac
 import ipaddress
 import secrets
 import uuid
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .db import get_config, get_db
+from .db import SessionLocal, get_config, get_db
 from .models import Node
 
 PBKDF2_ITERATIONS = 390_000
@@ -110,6 +111,12 @@ ApiKeyHeader = Annotated[str | None, Header(alias="X-ARQS-API-Key", convert_unde
 AuthorizationHeader = Annotated[str | None, Header(alias="Authorization")]
 
 
+@dataclass(frozen=True)
+class AuthenticatedNodeContext:
+    node_id: str
+    status: str
+
+
 def _extract_api_key(x_arqs_api_key: str | None, authorization: str | None) -> str:
     if x_arqs_api_key:
         return x_arqs_api_key.strip()
@@ -118,13 +125,7 @@ def _extract_api_key(x_arqs_api_key: str | None, authorization: str | None) -> s
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing api key")
 
 
-def require_node(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    x_arqs_api_key: ApiKeyHeader = None,
-    authorization: AuthorizationHeader = None,
-) -> Node:
-    api_key = _extract_api_key(x_arqs_api_key, authorization)
+def _authenticate_node(request: Request, db: Session, api_key: str) -> Node:
     key_id = extract_key_id(api_key)
     if key_id is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
@@ -145,3 +146,24 @@ def require_node(
 
     request.state.node_id = node.node_id
     return node
+
+
+def require_node(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    x_arqs_api_key: ApiKeyHeader = None,
+    authorization: AuthorizationHeader = None,
+) -> Node:
+    api_key = _extract_api_key(x_arqs_api_key, authorization)
+    return _authenticate_node(request, db, api_key)
+
+
+def require_node_context(
+    request: Request,
+    x_arqs_api_key: ApiKeyHeader = None,
+    authorization: AuthorizationHeader = None,
+) -> AuthenticatedNodeContext:
+    api_key = _extract_api_key(x_arqs_api_key, authorization)
+    with SessionLocal() as db:
+        node = _authenticate_node(request, db, api_key)
+        return AuthenticatedNodeContext(node_id=node.node_id, status=node.status)

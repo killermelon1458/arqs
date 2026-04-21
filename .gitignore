@@ -105,6 +105,7 @@ client_state/
 adapter_state/
 discord_adapter_state/
 test_*.py
+!tests/**/test_*.py
 
 zip_archive
 clients/arqs_messages_gui_2.py

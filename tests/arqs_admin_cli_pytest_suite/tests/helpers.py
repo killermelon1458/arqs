@@ -41,7 +41,6 @@ class SeededExpiredState:
     link_code_id: str
     packet_id: str
     delivery_id: str
-    ip: str
 
 
 @dataclass
@@ -247,7 +246,6 @@ class AdminCLIHarness:
         link_code_id = str(uuid.uuid4())
         packet_id = str(uuid.uuid4())
         delivery_id = str(uuid.uuid4())
-        expired_ip = "203.0.113.9"
 
         with self.connect() as conn:
             conn.execute(
@@ -342,19 +340,6 @@ class AdminCLIHarness:
                 """,
                 (str(uuid.uuid4()), node_id, sqlite_timestamp(now - timedelta(minutes=5))),
             )
-            conn.execute(
-                """
-                INSERT INTO ip_access_rules (ip, action, reason, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    expired_ip,
-                    "deny",
-                    "expired rule",
-                    sqlite_timestamp(now - timedelta(hours=1)),
-                    sqlite_timestamp(now - timedelta(minutes=1)),
-                ),
-            )
 
         return SeededExpiredState(
             node_id=node_id,
@@ -362,5 +347,4 @@ class AdminCLIHarness:
             link_code_id=link_code_id,
             packet_id=packet_id,
             delivery_id=delivery_id,
-            ip=expired_ip,
         )

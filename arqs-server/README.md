@@ -195,6 +195,11 @@ In `dynamic` mode, the system can operate either as:
 
 Separately from client IP policy, `blacklist.node_ids` denies authenticated access for listed node IDs.
 
+Operational note:
+
+* IP-based blocking has not yet been fully validated in real deployment conditions.
+* Until that validation work is complete, `ip_access_mode = "off"` is the recommended setting for normal development/testing deployments unless you are intentionally testing IP access behavior in an environment where the server is known to receive trustworthy client IP information.
+
 ## Docker
 
 The repository includes Docker support and a compose file. In the shipped config, the server stores its SQLite database under `/data/arqs.db`, so the `/data` path should be persisted.
