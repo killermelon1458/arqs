@@ -23,12 +23,14 @@ from typing import Any, Literal
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+import ipaddress
 import json
 import uuid
 
 
 LinkMode = Literal["bidirectional", "a_to_b", "b_to_a"]
 AckStatus = Literal["received", "handled", "rejected", "failed", "invalid", "unsupported"]
+TransportPolicy = Literal["allow_http", "prefer_https", "require_https"]
 
 DEFAULT_API_KEY_HEADER = "X-ARQS-API-Key"
 AUTHORIZATION_HEADER = "Authorization"
@@ -67,6 +69,10 @@ class ARQSHTTPError(ARQSError):
 
 class ARQSConnectionError(ARQSError):
     """Raised for local transport issues such as DNS, TCP, or timeout failures."""
+
+
+class ARQSInsecureTransportError(ARQSError):
+    """Raised when an authenticated request would send credentials over insecure HTTP."""
 
 
 @dataclass(frozen=True)
@@ -196,6 +202,32 @@ class ServerStats:
     time: datetime
 
 
+@dataclass(frozen=True)
+class TransportProbeAttempt:
+    requested_url: str
+    final_url: str | None
+    reachable: bool
+    redirected: bool
+    status_code: int | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class TransportProbeResult:
+    original_base_url: str
+    normalized_http_base_url: str | None
+    normalized_https_base_url: str | None
+    http_attempt: TransportProbeAttempt | None
+    https_attempt: TransportProbeAttempt | None
+    recommended_base_url: str | None
+    classification: str
+
+
+class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
 class ARQSClient:
     """Thin synchronous client for the ARQS server HTTP API."""
 
@@ -207,13 +239,20 @@ class ARQSClient:
         timeout: float = 30.0,
         api_key_header: str = DEFAULT_API_KEY_HEADER,
         user_agent: str = "arqs_api.py/1.0",
+        transport_policy: TransportPolicy = "prefer_https",
+        allow_local_http_auth: bool = True,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _normalize_base_url(base_url)
         self.api_key = api_key
         self.timeout = float(timeout)
         self.api_key_header = _normalize_api_key_header(api_key_header)
         self.user_agent = user_agent
+        self.transport_policy = _normalize_transport_policy(transport_policy)
+        self.allow_local_http_auth = bool(allow_local_http_auth)
         self.identity: NodeIdentity | None = None
+        self.last_request_requested_url: str | None = None
+        self.last_request_final_url: str | None = None
+        self.last_request_redirected = False
 
     @classmethod
     def from_identity_file(
@@ -224,6 +263,8 @@ class ARQSClient:
         timeout: float = 30.0,
         api_key_header: str = DEFAULT_API_KEY_HEADER,
         user_agent: str = "arqs_api.py/1.0",
+        transport_policy: TransportPolicy = "prefer_https",
+        allow_local_http_auth: bool = True,
     ) -> "ARQSClient":
         identity = NodeIdentity.load(identity_path)
         client = cls(
@@ -232,6 +273,8 @@ class ARQSClient:
             timeout=timeout,
             api_key_header=api_key_header,
             user_agent=user_agent,
+            transport_policy=transport_policy,
+            allow_local_http_auth=allow_local_http_auth,
         )
         client.identity = identity
         return client
@@ -426,6 +469,71 @@ class ARQSClient:
             time=_parse_datetime(result["time"]),
         )
 
+    def probe_transport(self, base_url: str | None = None, *, timeout: float | None = None) -> TransportProbeResult:
+        original_base_url = _normalize_base_url(base_url or self.base_url)
+        parts = urllib_parse.urlsplit(original_base_url)
+        scheme = parts.scheme.lower()
+        if scheme not in {"http", "https"}:
+            raise ValueError("ARQS base URL must use http:// or https:// for transport probing")
+
+        normalized_http_base_url = None
+        normalized_https_base_url = None
+        if scheme == "http":
+            normalized_http_base_url = original_base_url
+            try:
+                normalized_https_base_url = _swap_scheme(original_base_url, "https")
+            except ValueError:
+                normalized_https_base_url = None
+        else:
+            normalized_https_base_url = original_base_url
+            try:
+                normalized_http_base_url = _swap_scheme(original_base_url, "http")
+            except ValueError:
+                normalized_http_base_url = None
+
+        effective_timeout = self.timeout if timeout is None else float(timeout)
+        http_attempt: TransportProbeAttempt | None = None
+        https_attempt: TransportProbeAttempt | None = None
+        recommended_base_url: str | None = None
+        classification = "unreachable"
+
+        if scheme == "https":
+            https_attempt = self._probe_health(normalized_https_base_url, timeout=effective_timeout)
+            if https_attempt.reachable:
+                classification = "https_only"
+                recommended_base_url = normalized_https_base_url
+            else:
+                classification = "https_failed"
+        else:
+            http_attempt = self._probe_health(normalized_http_base_url, timeout=effective_timeout)
+            if normalized_https_base_url is not None:
+                https_attempt = self._probe_health(normalized_https_base_url, timeout=effective_timeout)
+
+            if http_attempt.redirected and http_attempt.final_url and _is_https_url(http_attempt.final_url):
+                classification = "http_redirects_to_https"
+                recommended_base_url = normalized_https_base_url
+            elif http_attempt.reachable and https_attempt is not None and https_attempt.reachable:
+                classification = "both_http_and_https"
+                recommended_base_url = normalized_https_base_url
+            elif https_attempt is not None and https_attempt.reachable:
+                classification = "https_only"
+                recommended_base_url = normalized_https_base_url
+            elif http_attempt.reachable:
+                classification = "http_only"
+                recommended_base_url = normalized_http_base_url
+            else:
+                classification = "unreachable"
+
+        return TransportProbeResult(
+            original_base_url=original_base_url,
+            normalized_http_base_url=normalized_http_base_url,
+            normalized_https_base_url=normalized_https_base_url,
+            http_attempt=http_attempt,
+            https_attempt=https_attempt,
+            recommended_base_url=recommended_base_url,
+            classification=classification,
+        )
+
     def _request_json(
         self,
         method: str,
@@ -449,6 +557,7 @@ class ARQSClient:
         if require_auth:
             if not self.api_key:
                 raise ARQSError("this request requires an API key, but no API key is set")
+            self._ensure_authenticated_transport_allowed()
             if self.api_key_header == AUTHORIZATION_HEADER:
                 token = self.api_key.strip()
                 if token.lower().startswith("bearer "):
@@ -460,11 +569,15 @@ class ARQSClient:
         req = urllib_request.Request(url=url, data=body_bytes, headers=headers, method=method.upper())
         try:
             with urllib_request.urlopen(req, timeout=effective_timeout) as response:
+                final_url = _normalize_observed_url(response.geturl()) or url
+                self._record_last_request(url, final_url)
                 raw = response.read().decode("utf-8")
                 if not raw:
                     return None
                 return json.loads(raw)
         except urllib_error.HTTPError as exc:
+            final_url = _normalize_observed_url(exc.geturl()) or url
+            self._record_last_request(url, final_url)
             raw = exc.read().decode("utf-8", errors="replace")
             parsed: Any | None = None
             detail: Any = raw
@@ -479,8 +592,10 @@ class ARQSClient:
                     detail = raw
             raise ARQSHTTPError(exc.code, detail, response_json=parsed, response_text=raw) from exc
         except urllib_error.URLError as exc:
+            self._record_last_request(url, None)
             raise ARQSConnectionError(f"failed to reach ARQS server at {url}: {exc}") from exc
         except TimeoutError as exc:
+            self._record_last_request(url, None)
             raise ARQSConnectionError(f"request to ARQS server timed out after {effective_timeout} seconds") from exc
 
     def _build_url(self, path: str, *, params: dict[str, Any] | None = None) -> str:
@@ -491,11 +606,145 @@ class ARQSClient:
                 url = f"{url}?{encoded}"
         return url
 
+    def _probe_health(self, base_url: str | None, *, timeout: float) -> TransportProbeAttempt | None:
+        if not base_url:
+            return None
+
+        requested_url = f"{base_url}/health"
+        req = urllib_request.Request(
+            url=requested_url,
+            headers={"Accept": "application/json", "User-Agent": self.user_agent},
+            method="GET",
+        )
+        opener = urllib_request.build_opener(_NoRedirectHandler())
+        try:
+            with opener.open(req, timeout=timeout) as response:
+                final_url = _normalize_observed_url(response.geturl()) or requested_url
+                return TransportProbeAttempt(
+                    requested_url=requested_url,
+                    final_url=final_url,
+                    reachable=True,
+                    redirected=final_url != requested_url,
+                    status_code=response.getcode(),
+                    error=None,
+                )
+        except urllib_error.HTTPError as exc:
+            if exc.code in {301, 302, 303, 307, 308}:
+                location = exc.headers.get("Location")
+                final_url = urllib_parse.urljoin(requested_url, location) if location else None
+                normalized_final_url = _normalize_observed_url(final_url)
+                return TransportProbeAttempt(
+                    requested_url=requested_url,
+                    final_url=normalized_final_url,
+                    reachable=True,
+                    redirected=normalized_final_url is not None and normalized_final_url != requested_url,
+                    status_code=exc.code,
+                    error=None,
+                )
+            return TransportProbeAttempt(
+                requested_url=requested_url,
+                final_url=requested_url,
+                reachable=True,
+                redirected=False,
+                status_code=exc.code,
+                error=None,
+            )
+        except urllib_error.URLError as exc:
+            return TransportProbeAttempt(
+                requested_url=requested_url,
+                final_url=None,
+                reachable=False,
+                redirected=False,
+                status_code=None,
+                error=str(exc.reason or exc),
+            )
+        except TimeoutError as exc:
+            return TransportProbeAttempt(
+                requested_url=requested_url,
+                final_url=None,
+                reachable=False,
+                redirected=False,
+                status_code=None,
+                error=str(exc),
+            )
+
+    def _ensure_authenticated_transport_allowed(self) -> None:
+        if not _is_http_url(self.base_url):
+            return
+        if self.transport_policy == "allow_http":
+            return
+        if self.transport_policy == "prefer_https" and self.allow_local_http_auth and _host_is_loopback_or_local(self.base_url):
+            return
+        raise ARQSInsecureTransportError(
+            "Authenticated ARQS request blocked because base URL uses HTTP. Use HTTPS or explicitly allow HTTP transport."
+        )
+
+    def _record_last_request(self, requested_url: str, final_url: str | None) -> None:
+        self.last_request_requested_url = requested_url
+        self.last_request_final_url = final_url
+        self.last_request_redirected = bool(final_url and final_url != requested_url)
+
 
 def _stringify_id(value: str | uuid.UUID) -> str:
     if isinstance(value, uuid.UUID):
         return str(value)
     return str(value)
+
+
+def _normalize_base_url(base_url: str) -> str:
+    raw = str(base_url or "").strip()
+    if not raw:
+        return ""
+    parts = urllib_parse.urlsplit(raw)
+    if not parts.scheme:
+        return raw.rstrip("/")
+    normalized_path = parts.path.rstrip("/")
+    return urllib_parse.urlunsplit((parts.scheme.lower(), parts.netloc, normalized_path, "", ""))
+
+
+def _swap_scheme(base_url: str, scheme: str) -> str:
+    normalized = _normalize_base_url(base_url)
+    parts = urllib_parse.urlsplit(normalized)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        raise ValueError("ARQS base URL must include an http or https scheme and host")
+    return urllib_parse.urlunsplit((scheme.lower(), parts.netloc, parts.path, "", ""))
+
+
+def _is_https_url(base_url: str) -> bool:
+    return urllib_parse.urlsplit(_normalize_base_url(base_url)).scheme.lower() == "https"
+
+
+def _is_http_url(base_url: str) -> bool:
+    return urllib_parse.urlsplit(_normalize_base_url(base_url)).scheme.lower() == "http"
+
+
+def _host_is_loopback_or_local(base_url: str) -> bool:
+    host = urllib_parse.urlsplit(_normalize_base_url(base_url)).hostname
+    if not host:
+        return False
+    lowered = host.lower()
+    if lowered in {"localhost", "::1"}:
+        return True
+    try:
+        address = ipaddress.ip_address(lowered)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private or address.is_link_local
+
+
+def _normalize_observed_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    parts = urllib_parse.urlsplit(str(value))
+    path = parts.path.rstrip("/")
+    return urllib_parse.urlunsplit((parts.scheme.lower(), parts.netloc, path, parts.query, parts.fragment))
+
+
+def _normalize_transport_policy(value: TransportPolicy | str) -> TransportPolicy:
+    policy = str(value or "").strip().lower()
+    if policy in {"allow_http", "prefer_https", "require_https"}:
+        return policy
+    raise ValueError("transport_policy must be 'allow_http', 'prefer_https', or 'require_https'")
 
 
 def _normalize_api_key_header(value: str) -> str:
@@ -594,6 +843,7 @@ __all__ = [
     "ARQSError",
     "ARQSHTTPError",
     "ARQSConnectionError",
+    "ARQSInsecureTransportError",
     "NodeIdentity",
     "RotatedKey",
     "IdentityDeleteResult",
@@ -605,7 +855,10 @@ __all__ = [
     "Delivery",
     "HealthStatus",
     "ServerStats",
+    "TransportProbeAttempt",
+    "TransportProbeResult",
     "ARQSClient",
     "LinkMode",
     "AckStatus",
+    "TransportPolicy",
 ]

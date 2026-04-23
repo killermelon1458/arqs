@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import queue
 import re
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
+from urllib import parse as urllib_parse
 
 # Resolve `arqs_api` by script location so the GUI works with a local copy,
 # the repo-shared `/apis` copy, or an installed module.
@@ -27,7 +29,7 @@ for _candidate in (SCRIPT_DIR, SCRIPT_DIR.parent / "apis"):
             sys.path.insert(0, candidate_str)
         break
 
-from arqs_api import ARQSClient, ARQSHTTPError, Endpoint, Link, LinkCode
+from arqs_api import ARQSClient, ARQSHTTPError, Endpoint, Link, LinkCode, TransportProbeResult, TransportPolicy
 
 APP_NAME = "ARQS Messages GUI"
 APP_DIR = Path.home() / ".arqs_messages_gui"
@@ -61,6 +63,7 @@ DEFAULT_CONFIG = {
     "last_selected_conversation": None,
     "enable_pingback": False,
     "pingback_delay_seconds": "0",
+    "transport_preferences": {},
 }
 
 
@@ -123,6 +126,7 @@ class App:
         self.session_id = uuid.uuid4().hex
         self.session_log_lock = threading.Lock()
         self.pending_ping_measurements: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+        self.transport_probe_cache: dict[str, TransportProbeResult] = {}
 
         self._build_ui()
         self._rotate_session_log()
@@ -158,7 +162,9 @@ class App:
 
         ttk.Label(top, text="Server URL").grid(row=0, column=0, sticky="w")
         self.base_url_var = tk.StringVar(value=str(self.config.get("base_url", DEFAULT_CONFIG["base_url"])))
-        ttk.Entry(top, textvariable=self.base_url_var).grid(row=0, column=1, sticky="ew", padx=(6, 10))
+        self.base_url_entry = ttk.Entry(top, textvariable=self.base_url_var)
+        self.base_url_entry.grid(row=0, column=1, sticky="ew", padx=(6, 10))
+        self.base_url_entry.bind("<FocusOut>", self._on_server_url_focus_out)
 
         ttk.Button(top, text="Load Identity", command=self.load_identity).grid(row=0, column=2, padx=2)
         ttk.Button(top, text="Register Node", command=self.register_node).grid(row=0, column=3, padx=2)
@@ -602,22 +608,278 @@ class App:
     def _future_iso(self, seconds: int) -> str:
         return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
-    def _refresh_client_from_disk(self) -> None:
-        base_url = self.base_url_var.get().strip()
+    def _normalize_server_url_for_gui(self, base_url: str) -> str:
+        raw = str(base_url or "").strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        parts = urllib_parse.urlsplit(raw)
+        path = parts.path.rstrip("/")
+        return urllib_parse.urlunsplit((parts.scheme.lower(), parts.netloc, path, "", ""))
+
+    def _transport_preference_key(self, base_url: str) -> str:
+        normalized = self._normalize_server_url_for_gui(base_url)
+        parts = urllib_parse.urlsplit(normalized)
+        return parts.netloc.lower() or normalized.lower()
+
+    def _get_saved_transport_preference(self, base_url: str) -> str | None:
+        prefs = self.config.setdefault("transport_preferences", {})
+        value = prefs.get(self._transport_preference_key(base_url))
+        if value in {"allow_http", "prefer_https", "require_https"}:
+            return str(value)
+        return None
+
+    def _set_saved_transport_preference(self, base_url: str, preference: str | None) -> None:
+        prefs = self.config.setdefault("transport_preferences", {})
+        key = self._transport_preference_key(base_url)
+        if preference is None:
+            prefs.pop(key, None)
+        else:
+            prefs[key] = preference
+        self._save_config()
+
+    def _is_local_server_url(self, base_url: str) -> bool:
+        host = urllib_parse.urlsplit(self._normalize_server_url_for_gui(base_url)).hostname
+        if not host:
+            return False
+        lowered = host.lower()
+        if lowered in {"localhost", "::1"}:
+            return True
+        try:
+            address = ipaddress.ip_address(lowered)
+        except ValueError:
+            return False
+        return address.is_loopback or address.is_private or address.is_link_local
+
+    def _current_transport_policy(self, base_url: str | None = None) -> TransportPolicy:
+        normalized = self._normalize_server_url_for_gui(base_url or self.base_url_var.get().strip())
+        if normalized.startswith("https://"):
+            return "prefer_https"
+        if self._get_saved_transport_preference(normalized) == "allow_http":
+            return "allow_http"
+        return "prefer_https"
+
+    def _rebuild_client_for_current_url(
+        self,
+        *,
+        transport_policy: TransportPolicy | None = None,
+        update_status: bool = True,
+    ) -> None:
+        base_url = self._normalize_server_url_for_gui(self.base_url_var.get().strip())
+        if hasattr(self, "base_url_var") and self.base_url_var.get().strip() != base_url:
+            self.base_url_var.set(base_url)
         if not base_url:
             self.client = None
             return
+        effective_policy = transport_policy or self._current_transport_policy(base_url)
+        previous_identity = self.client.identity if self.client is not None else None
         if IDENTITY_PATH.exists():
             try:
-                self.client = ARQSClient.from_identity_file(base_url, IDENTITY_PATH)
-                self.set_status(f"Loaded identity for node {self.client.identity.node_id}.")
+                self.client = ARQSClient.from_identity_file(
+                    base_url,
+                    IDENTITY_PATH,
+                    transport_policy=effective_policy,
+                )
+                if update_status and self.client.identity is not None:
+                    self.set_status(f"Loaded identity for node {self.client.identity.node_id}.")
                 return
             except Exception as exc:
-                self.client = ARQSClient(base_url)
-                self.set_status(f"Identity file exists but failed to load: {exc}")
+                self.client = ARQSClient(base_url, transport_policy=effective_policy)
+                if update_status:
+                    self.set_status(f"Identity file exists but failed to load: {exc}")
                 return
-        self.client = ARQSClient(base_url)
-        self.set_status("No saved identity loaded yet.")
+        self.client = ARQSClient(base_url, transport_policy=effective_policy)
+        if previous_identity is not None and self.client.identity is None:
+            self.client.adopt_identity(previous_identity)
+        if update_status:
+            self.set_status("No saved identity loaded yet.")
+
+    def _refresh_client_from_disk(self) -> None:
+        self._rebuild_client_for_current_url(update_status=True)
+
+    def _get_transport_probe_result(self, base_url: str) -> TransportProbeResult:
+        normalized = self._normalize_server_url_for_gui(base_url)
+        cached = self.transport_probe_cache.get(normalized)
+        if cached is not None:
+            return cached
+        result = ARQSClient(normalized).probe_transport()
+        self.transport_probe_cache[normalized] = result
+        return result
+
+    def _transport_failure_message(self, probe: TransportProbeResult) -> str:
+        details: list[str] = []
+        if probe.http_attempt is not None and probe.http_attempt.error:
+            details.append(f"HTTP probe failed: {probe.http_attempt.error}")
+        if probe.https_attempt is not None and probe.https_attempt.error:
+            details.append(f"HTTPS probe failed: {probe.https_attempt.error}")
+        if details:
+            return "\n\n" + "\n".join(details)
+        return ""
+
+    def _apply_transport_result(self, probe: TransportProbeResult) -> bool:
+        normalized = probe.original_base_url
+        requested_https = normalized.startswith("https://")
+        is_local = self._is_local_server_url(normalized)
+        saved_preference = self._get_saved_transport_preference(normalized)
+
+        if requested_https:
+            if probe.classification == "https_failed":
+                message = (
+                    "HTTPS connection failed.\n\n"
+                    "The server may not support HTTPS or there may be a certificate or tunnel problem.\n\n"
+                    "To use HTTP instead, choose an HTTP server URL explicitly later."
+                    f"{self._transport_failure_message(probe)}"
+                )
+                self.set_status("HTTPS connection failed.")
+                messagebox.showerror(APP_NAME, message)
+                return False
+            self.base_url_var.set(normalized)
+            self._rebuild_client_for_current_url(update_status=False)
+            return True
+
+        if probe.classification == "http_redirects_to_https":
+            upgraded = probe.normalized_https_base_url or probe.recommended_base_url
+            if not upgraded:
+                messagebox.showerror(APP_NAME, "Server redirected to HTTPS, but the upgraded URL could not be determined.")
+                return False
+            self.base_url_var.set(upgraded)
+            self._set_saved_transport_preference(normalized, "prefer_https")
+            self._rebuild_client_for_current_url(update_status=False)
+            self.set_status("Server redirects HTTP to HTTPS. Updated server URL to HTTPS.")
+            messagebox.showinfo(APP_NAME, "Server redirects HTTP to HTTPS. Updated server URL to HTTPS.")
+            return True
+
+        if probe.classification == "https_only":
+            upgraded = probe.normalized_https_base_url or probe.recommended_base_url
+            if not upgraded:
+                messagebox.showerror(APP_NAME, "HTTPS is reachable, but the upgraded server URL could not be determined.")
+                return False
+            self.base_url_var.set(upgraded)
+            self._set_saved_transport_preference(normalized, "prefer_https")
+            self._rebuild_client_for_current_url(update_status=False)
+            self.set_status("Server is reachable over HTTPS. Updated server URL to HTTPS.")
+            messagebox.showinfo(APP_NAME, "Server is reachable over HTTPS. Updated server URL to HTTPS.")
+            return True
+
+        if probe.classification == "both_http_and_https":
+            if is_local:
+                self.base_url_var.set(normalized)
+                self._rebuild_client_for_current_url(update_status=False)
+                self.set_status("Local server supports HTTPS. Keeping the current HTTP URL.")
+                return True
+            if saved_preference == "allow_http":
+                self.base_url_var.set(normalized)
+                self._rebuild_client_for_current_url(transport_policy="allow_http", update_status=False)
+                self.set_status("Using remembered HTTP transport preference for this server.")
+                return True
+            if saved_preference in {"prefer_https", "require_https"}:
+                upgraded = probe.normalized_https_base_url or probe.recommended_base_url
+                if not upgraded:
+                    messagebox.showerror(APP_NAME, "HTTPS is available, but the upgraded server URL could not be determined.")
+                    return False
+                self.base_url_var.set(upgraded)
+                self._rebuild_client_for_current_url(update_status=False)
+                self.set_status("Using remembered HTTPS transport preference for this server.")
+                return True
+
+            choice, remember = ask_transport_decision(
+                self.root,
+                "HTTPS Available",
+                "This server supports HTTPS.\n\n"
+                "HTTPS is recommended.\n"
+                "HTTP sends traffic unencrypted.\n"
+                "Your ARQS API key can be exposed over HTTP.",
+                buttons=[("https", "Use HTTPS"), ("http", "Stay on HTTP"), ("cancel", "Cancel")],
+                default_choice="https",
+                remember_label="Remember my choice for this server",
+            )
+            if choice in (None, "cancel"):
+                self.set_status("Transport selection cancelled.")
+                return False
+            if choice == "https":
+                upgraded = probe.normalized_https_base_url or probe.recommended_base_url
+                if not upgraded:
+                    messagebox.showerror(APP_NAME, "HTTPS is available, but the upgraded server URL could not be determined.")
+                    return False
+                self.base_url_var.set(upgraded)
+                if remember:
+                    self._set_saved_transport_preference(normalized, "prefer_https")
+                self._rebuild_client_for_current_url(update_status=False)
+                self.set_status("Using HTTPS for this server.")
+                return True
+
+            self.base_url_var.set(normalized)
+            if remember:
+                self._set_saved_transport_preference(normalized, "allow_http")
+            self._rebuild_client_for_current_url(transport_policy="allow_http", update_status=False)
+            self.set_status("Using HTTP for this server.")
+            return True
+
+        if probe.classification == "http_only":
+            if is_local:
+                self.base_url_var.set(normalized)
+                self._rebuild_client_for_current_url(update_status=False)
+                self.set_status("Using local HTTP transport for this server.")
+                return True
+            if saved_preference == "allow_http":
+                self.base_url_var.set(normalized)
+                self._rebuild_client_for_current_url(transport_policy="allow_http", update_status=False)
+                self.set_status("Using remembered HTTP transport preference for this server.")
+                return True
+
+            choice, remember = ask_transport_decision(
+                self.root,
+                "HTTP Only Warning",
+                "This server does not appear to support HTTPS.\n\n"
+                "Your ARQS API key will be sent unencrypted over the network.\n"
+                "Anyone who can observe the connection may be able to impersonate this node.",
+                buttons=[("http", "Continue with HTTP"), ("cancel", "Cancel")],
+                default_choice="cancel",
+                remember_label="Remember my choice for this server",
+            )
+            if choice != "http":
+                self.set_status("Transport selection cancelled.")
+                return False
+            self.base_url_var.set(normalized)
+            if remember:
+                self._set_saved_transport_preference(normalized, "allow_http")
+            self._rebuild_client_for_current_url(transport_policy="allow_http", update_status=False)
+            self.set_status("Continuing with HTTP for this server.")
+            return True
+
+        if probe.classification == "unreachable":
+            message = "Could not reach this server over HTTP or HTTPS." + self._transport_failure_message(probe)
+            self.set_status("Server transport probe failed.")
+            messagebox.showerror(APP_NAME, message)
+            return False
+
+        message = "Transport probing failed for this server." + self._transport_failure_message(probe)
+        self.set_status("Transport probing failed.")
+        messagebox.showerror(APP_NAME, message)
+        return False
+
+    def _ensure_transport_ready_for_auth(self) -> bool:
+        raw_base_url = self.base_url_var.get().strip()
+        normalized = self._normalize_server_url_for_gui(raw_base_url)
+        if not normalized:
+            messagebox.showerror(APP_NAME, "Server URL is required.")
+            return False
+        if normalized != raw_base_url:
+            self.base_url_var.set(normalized)
+        try:
+            probe = self._get_transport_probe_result(normalized)
+        except Exception as exc:
+            self.set_status(str(exc))
+            messagebox.showerror(APP_NAME, str(exc))
+            return False
+        return self._apply_transport_result(probe)
+
+    def _on_server_url_focus_out(self, _event: Any = None) -> None:
+        normalized = self._normalize_server_url_for_gui(self.base_url_var.get().strip())
+        if normalized and normalized != self.base_url_var.get().strip():
+            self.base_url_var.set(normalized)
+            self._save_config()
 
     # --------------------------
     # Conversation and display
@@ -753,8 +1015,11 @@ class App:
         if not base_url:
             messagebox.showerror(APP_NAME, "Server URL is required.")
             return
+        if not self._ensure_transport_ready_for_auth():
+            return
         node_name = self.node_name_var.get().strip() or None
-        self.client = ARQSClient(base_url)
+        effective_url = self._normalize_server_url_for_gui(self.base_url_var.get().strip())
+        self.client = ARQSClient(effective_url, transport_policy=self._current_transport_policy(effective_url))
 
         def job() -> tuple[str, str]:
             assert self.client is not None
@@ -809,7 +1074,7 @@ class App:
                 pass
 
             self._clear_local_identity_state()
-            self.client = ARQSClient(self.base_url_var.get().strip())
+            self._rebuild_client_for_current_url(update_status=False)
 
             summary = (
                 f"Deleted node {result['node_id']} "
@@ -1305,6 +1570,11 @@ class App:
 
     def toggle_active_polling(self) -> None:
         enabled = bool(self.active_poll_var.get())
+        if enabled and not self._ensure_transport_ready_for_auth():
+            self._set_polling_ui(False)
+            self.config["active_polling"] = False
+            self._save_config()
+            return
         self._set_polling_ui(enabled)
         self._save_config()
         if enabled:
@@ -1559,6 +1829,7 @@ class App:
         return deleted_count
 
     def _clear_local_identity_state(self) -> None:
+        self.client = None
         self.links = []
         self.pending_codes = []
         self.seen_deliveries = set()
@@ -1579,14 +1850,19 @@ class App:
         self._save_config()
         self._refresh_conversations()
 
-    def require_client(self, *, silent: bool = False) -> ARQSClient | None:
+    def require_client(self, *, silent: bool = False, ensure_transport: bool = True) -> ARQSClient | None:
+        if ensure_transport and not self._ensure_transport_ready_for_auth():
+            return None
         if self.client is None:
-            self._refresh_client_from_disk()
+            self._rebuild_client_for_current_url(update_status=False)
         if self.client is None:
             if not silent:
                 messagebox.showerror(APP_NAME, "No client is loaded.")
             return None
-        self.client.base_url = self.base_url_var.get().strip().rstrip("/")
+        expected_base_url = self._normalize_server_url_for_gui(self.base_url_var.get().strip())
+        expected_policy = self._current_transport_policy(expected_base_url)
+        if self.client.base_url != expected_base_url or self.client.transport_policy != expected_policy:
+            self._rebuild_client_for_current_url(update_status=False)
         return self.client
 
     # --------------------------
@@ -1845,6 +2121,95 @@ class ContinueCancelDialog(tk.Toplevel):
 def ask_continue_cancel(parent: tk.Misc, title: str, message: str) -> bool:
     dialog = ContinueCancelDialog(parent, title, message)
     return dialog.result
+
+
+class TransportDecisionDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        message: str,
+        *,
+        buttons: list[tuple[str, str]],
+        default_choice: str,
+        remember_label: str | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.choice: str | None = None
+        self.default_choice = default_choice
+        self.remember_var = tk.BooleanVar(value=False)
+
+        self.title(title)
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        container = ttk.Frame(self, padding=12)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(container, text=message, wraplength=500, justify="left").grid(row=0, column=0, sticky="w")
+
+        if remember_label:
+            ttk.Checkbutton(container, text=remember_label, variable=self.remember_var).grid(
+                row=1,
+                column=0,
+                sticky="w",
+                pady=(12, 0),
+            )
+
+        buttons_frame = ttk.Frame(container)
+        buttons_frame.grid(row=2, column=0, sticky="e", pady=(12, 0))
+
+        self._buttons: dict[str, ttk.Button] = {}
+        for idx, (choice, label) in enumerate(buttons):
+            button = ttk.Button(buttons_frame, text=label, command=lambda value=choice: self._select(value))
+            button.grid(row=0, column=idx, padx=(0, 8) if idx < len(buttons) - 1 else 0)
+            self._buttons[choice] = button
+
+        self.bind("<Return>", lambda _event: self._select(self.default_choice))
+        self.bind("<Escape>", lambda _event: self._cancel())
+
+        self.update_idletasks()
+        parent_widget = parent.winfo_toplevel()
+        x = parent_widget.winfo_rootx() + 60
+        y = parent_widget.winfo_rooty() + 60
+        self.geometry(f"+{x}+{y}")
+
+        default_button = self._buttons.get(self.default_choice)
+        if default_button is not None:
+            default_button.focus_set()
+        self.wait_window(self)
+
+    def _select(self, choice: str) -> None:
+        self.choice = choice
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.choice = None
+        self.destroy()
+
+
+def ask_transport_decision(
+    parent: tk.Misc,
+    title: str,
+    message: str,
+    *,
+    buttons: list[tuple[str, str]],
+    default_choice: str,
+    remember_label: str | None = None,
+) -> tuple[str | None, bool]:
+    dialog = TransportDecisionDialog(
+        parent,
+        title,
+        message,
+        buttons=buttons,
+        default_choice=default_choice,
+        remember_label=remember_label,
+    )
+    return dialog.choice, bool(dialog.remember_var.get())
+
 
 class EndpointDialog(simpledialog.Dialog):
     def __init__(self, parent: tk.Misc, title: str) -> None:

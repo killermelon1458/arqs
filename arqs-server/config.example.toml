@@ -43,7 +43,7 @@ cleanup_interval_seconds = 60
 
 [observability]
 health_mode = "public"
-stats_mode = "public"
+stats_mode = "off"
 
 # Recommended production posture:
 # [observability]
