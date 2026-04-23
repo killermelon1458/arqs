@@ -246,7 +246,7 @@ class App:
 
         ttk.Button(
             controls,
-            text="Delete History",
+            text="Delete Conversation",
             command=self.delete_message_history,
         ).grid(row=0, column=2, sticky="ew", padx=4)
 
