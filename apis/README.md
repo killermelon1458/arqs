@@ -84,6 +84,10 @@ The client exposes small dataclasses for the main transport objects:
 * `HealthStatus`
 * `ServerStats`
 
+`HealthStatus` now contains only `status` and `time`.
+
+`ServerStats` contains aggregate counters plus `time`.
+
 ## Error model
 
 The client raises:
@@ -256,7 +260,11 @@ health = client.health()
 stats = client.stats()
 ```
 
-Useful for smoke tests, readiness checks, and operational dashboards.
+`health()` expects the minimal public `/health` payload: `status` and `time`.
+
+`stats()` expects aggregate totals plus `time`.
+
+Depending on server `[observability]` config, `stats()` may raise `ARQSHTTPError` with `401`, `403`, or `404` instead of returning data.
 
 ## Example end-to-end script
 

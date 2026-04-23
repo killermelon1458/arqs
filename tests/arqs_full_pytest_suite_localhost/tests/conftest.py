@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from .helpers import BASE_URL, create_trio, raw_json_request
+from .helpers import BASE_URL, assert_health_response_schema, create_trio, observability_detail, raw_json_request
 
 
 def pytest_addoption(parser):
@@ -42,7 +42,13 @@ def base_url() -> str:
 @pytest.fixture(scope="session")
 def server_alive(base_url: str):
     status, body = raw_json_request("GET", "/health")
+    if status in {401, 403, 404}:
+        pytest.skip(
+            "Server health observability is not publicly available for this test run: "
+            f"HTTP {status} {observability_detail(body)!r}"
+        )
     assert status == 200, f"Server at {base_url} did not answer /health with 200; got {status} / {body!r}"
+    assert_health_response_schema(body)
     return body
 
 

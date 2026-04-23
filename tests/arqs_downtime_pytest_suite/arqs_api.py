@@ -182,8 +182,6 @@ class Delivery:
 @dataclass(frozen=True)
 class HealthStatus:
     status: str
-    app: str
-    db_path: str
     time: datetime
 
 
@@ -195,6 +193,7 @@ class ServerStats:
     queued_packets_total: int
     queued_bytes_total: int
     link_codes_active_total: int
+    time: datetime
 
 
 class ARQSClient:
@@ -412,8 +411,6 @@ class ARQSClient:
         result = self._request_json("GET", "/health")
         return HealthStatus(
             status=str(result["status"]),
-            app=str(result["app"]),
-            db_path=str(result["db_path"]),
             time=_parse_datetime(result["time"]),
         )
 
@@ -426,6 +423,7 @@ class ARQSClient:
             queued_packets_total=int(result["queued_packets_total"]),
             queued_bytes_total=int(result["queued_bytes_total"]),
             link_codes_active_total=int(result["link_codes_active_total"]),
+            time=_parse_datetime(result["time"]),
         )
 
     def _request_json(

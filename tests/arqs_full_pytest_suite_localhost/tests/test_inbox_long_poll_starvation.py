@@ -6,7 +6,14 @@ import warnings
 
 import pytest
 
-from .helpers import create_endpoint, create_trio, link_bidirectional, raw_json_request
+from .helpers import (
+    assert_health_response_schema,
+    create_endpoint,
+    create_trio,
+    link_bidirectional,
+    observability_detail,
+    raw_json_request,
+)
 
 
 IDLE_WAITERS = 24
@@ -80,7 +87,13 @@ def _wait_for_server_recovery(*, timeout: float = RECOVERY_TIMEOUT_SECONDS) -> N
         try:
             status, body = raw_json_request("GET", "/health", timeout=1.0)
             if status == 200:
+                assert_health_response_schema(body)
                 return
+            if status in {401, 403, 404}:
+                pytest.skip(
+                    "server health observability is not publicly available for starvation tests: "
+                    f"HTTP {status} {observability_detail(body)!r}"
+                )
             last_error = f"HTTP {status}: {body!r}"
         except BaseException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -96,7 +109,10 @@ def _check_server_health_once() -> tuple[bool, str]:
     try:
         status, body = raw_json_request("GET", "/health", timeout=1.0)
         if status == 200:
+            assert_health_response_schema(body)
             return True, "HTTP 200"
+        if status in {401, 403, 404}:
+            return False, f"HTTP {status}: health observability unavailable ({observability_detail(body)!r})"
         return False, f"HTTP {status}: {body!r}"
     except BaseException as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -168,6 +184,7 @@ def test_many_idle_long_polls_should_not_block_public_health(starvation_actor_tr
 
         _assert_request_stays_fast(started, operation="GET /health")
         assert status == 200, f"Expected /health to stay available, got HTTP {status}: {body!r}"
+        assert_health_response_schema(body)
     finally:
         _join_threads(threads, timeout=LONG_POLL_TIMEOUT_SECONDS + 2.0)
 

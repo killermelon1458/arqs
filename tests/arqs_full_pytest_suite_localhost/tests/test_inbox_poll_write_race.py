@@ -10,7 +10,7 @@ import pytest
 
 from arqs_api import ARQSHTTPError
 
-from .helpers import BASE_URL, create_trio, link_bidirectional, raw_json_request
+from .helpers import BASE_URL, assert_health_response_schema, create_trio, link_bidirectional, raw_json_request
 
 
 def _auth_headers(api_key: str) -> dict[str, str]:
@@ -21,6 +21,7 @@ def _auth_headers(api_key: str) -> dict[str, str]:
 def test_repeated_overlapping_poll_and_ack_should_not_trigger_inbox_500():
     health_status, health_body = raw_json_request("GET", "/health")
     assert health_status == 200, f"Server at {BASE_URL} did not answer /health with 200; got {health_status} / {health_body!r}"
+    assert_health_response_schema(health_body)
 
     workspace_tmp_root = Path(__file__).resolve().parents[1] / "local_tmp"
     workspace_tmp_root.mkdir(parents=True, exist_ok=True)

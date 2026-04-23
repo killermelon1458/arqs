@@ -41,6 +41,10 @@ ip_access_mode = "dynamic"
 [maintenance]
 cleanup_interval_seconds = 60
 
+[observability]
+health_mode = "public"
+stats_mode = "public"
+
 # When ip_access_mode = "config", this is the only client IP block list used.
 # When ip_access_mode = "dynamic", this remains a static fallback deny list.
 [blacklist]

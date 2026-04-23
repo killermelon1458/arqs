@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -193,6 +193,22 @@ def _fetch_inbox_deliveries(node_id: str, limit: int) -> list[dict]:
             }
         )
     return results
+
+
+def _enforce_observability_mode(request: Request, db: Session, mode: str) -> None:
+    if mode == "off":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if mode == "public":
+        return
+    if mode == "node_api_key":
+        require_node(
+            request=request,
+            db=db,
+            x_arqs_api_key=request.headers.get(cfg.server.api_key_header),
+            authorization=request.headers.get("Authorization"),
+        )
+        return
+    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="invalid observability mode")
 
 
 @app.on_event("startup")
@@ -855,18 +871,18 @@ def ack_packet(
 
 
 @app.get("/health", response_model=HealthResponse)
-def health(db: Annotated[Session, Depends(get_db)]):
+def health(request: Request, db: Annotated[Session, Depends(get_db)]):
+    _enforce_observability_mode(request, db, cfg.observability.health_mode)
     db.execute(select(1)).scalar_one()
     return HealthResponse(
         status="ok",
-        app=cfg.server.app_name,
-        db_path=cfg.storage.db_path,
-        time=datetime.now(UTC).replace(tzinfo=None),
+        time=utcnow(),
     )
 
 
 @app.get("/stats", response_model=StatsResponse)
-def stats(db: Annotated[Session, Depends(get_db)]):
+def stats(request: Request, db: Annotated[Session, Depends(get_db)]):
+    _enforce_observability_mode(request, db, cfg.observability.stats_mode)
     now = utcnow()
     nodes_total = int(db.scalar(select(func.count()).select_from(Node)) or 0)
     endpoints_total = int(db.scalar(select(func.count()).select_from(Endpoint)) or 0)
@@ -899,4 +915,5 @@ def stats(db: Annotated[Session, Depends(get_db)]):
         queued_packets_total=queued_packets_total,
         queued_bytes_total=queued_bytes_total,
         link_codes_active_total=link_codes_active_total,
+        time=now,
     )

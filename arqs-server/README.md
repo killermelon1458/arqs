@@ -250,6 +250,12 @@ Implemented endpoints:
 * `GET /health`
 * `GET /stats`
 
+Observability exposure is config-driven:
+
+* `/health` is intended to stay public and returns only `status` and `time`
+* `/stats` may be public, require any valid node API key, or be disabled with `404`
+* both endpoints are controlled by `[observability]` in `config.toml`
+
 ---
 
 ## Minimal example flow
@@ -305,4 +311,3 @@ Anyone deploying ARQS should assume that the present implementation is suitable 
 This README describes the **current server implementation** and its concrete transport surface.
 
 Client UX, adapters, bootstrap flows, and higher-level application behavior may evolve independently. They should not be assumed from this server README unless they are explicitly documented in the relevant component.
-

@@ -102,14 +102,41 @@ def raw_json_request(method: str, path: str, *, timeout: float = 5.0) -> tuple[i
         raise HarnessError(f"request to {url} failed: {exc}") from exc
 
 
+def _observability_detail(body: Any) -> str:
+    if isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, str):
+            return detail
+    if isinstance(body, str):
+        return body
+    return repr(body)
+
+
+def _is_public_health_ok(status: int, body: Any) -> bool:
+    return (
+        status == 200
+        and isinstance(body, dict)
+        and body.get("status") == "ok"
+        and "time" in body
+        and "app" not in body
+        and "db_path" not in body
+    )
+
+
 def ensure_server_healthy(timeout_seconds: int = STARTUP_TIMEOUT_SECONDS) -> None:
     deadline = time.time() + timeout_seconds
     last_error: str | None = None
     while time.time() < deadline:
         try:
             status, body = raw_json_request("GET", "/health", timeout=3.0)
-            if status == 200 and isinstance(body, dict) and body.get("status") == "ok":
+            if _is_public_health_ok(status, body):
                 return
+            if status in {401, 403, 404}:
+                last_error = (
+                    "public /health is unavailable for the downtime harness: "
+                    f"HTTP {status} {_observability_detail(body)!r}"
+                )
+                break
             last_error = f"unexpected /health response: {status} {body!r}"
         except Exception as exc:
             last_error = str(exc)

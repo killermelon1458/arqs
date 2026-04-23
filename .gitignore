@@ -114,3 +114,4 @@ ARQS_Testing.md
 tests/multi_machine_tests
 arqs-server/INBOX_READ_ONLY_PATCH_PLAN.md
 clients/arqs_messages_gui_*.py
+Arqs_observability_patch_plam.md

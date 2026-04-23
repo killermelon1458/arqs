@@ -230,6 +230,7 @@ class App:
         controls.columnconfigure(0, weight=1)
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(2, weight=1)
+        controls.columnconfigure(3, weight=1)
 
         ttk.Button(
             controls,
@@ -239,15 +240,21 @@ class App:
 
         ttk.Button(
             controls,
-            text="Delete Link",
-            command=self.delete_link,
+            text="Sever Link",
+            command=self.sever_link,
         ).grid(row=0, column=1, sticky="ew", padx=4)
+
+        ttk.Button(
+            controls,
+            text="Delete History",
+            command=self.delete_message_history,
+        ).grid(row=0, column=2, sticky="ew", padx=4)
 
         ttk.Button(
             controls,
             text="Copy Link Code",
             command=self.copy_selected_pending_code,
-        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         self.conversation_header_var = tk.StringVar(value="No conversation selected")
         ttk.Label(right, textvariable=self.conversation_header_var, font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w")
@@ -937,74 +944,10 @@ class App:
         self._refresh_conversations()
         self.set_status("Contact label updated.")
 
-    def delete_link(self) -> None:
+    def sever_link(self) -> None:
         client = self.require_client()
         if client is None:
             return
-
-        convo = self.get_selected_conversation()
-        if convo is None:
-            messagebox.showerror(APP_NAME, "Select a conversation first.")
-            return
-
-        record = self._get_link_record(convo.local_endpoint_id, convo.remote_endpoint_id)
-        link_id = str(record.get("link_id") or "") if record is not None else ""
-
-        if record is None:
-            warning_text = (
-                "Warning: this conversation has no saved link record. "
-                "The local conversation history will be deleted, but there may be no server-side link to revoke. "
-                "This cannot be undone.\n\nAre you sure?"
-            )
-        else:
-            warning_text = (
-                "Warning: this will delete the link and all message history. "
-                "This cannot be undone.\n\nAre you sure?"
-            )
-
-        confirmed = ask_continue_cancel(
-            self.root,
-            "Delete Link",
-            warning_text,
-        )
-        if not confirmed:
-            self.set_status("Delete link cancelled.")
-            return
-
-        def job() -> dict[str, Any]:
-            revoke_error: str | None = None
-            if link_id and not link_id.startswith("local-"):
-                try:
-                    client.revoke_link(link_id)
-                except Exception as exc:
-                    revoke_error = str(exc)
-
-            return {
-                "local_endpoint_id": convo.local_endpoint_id,
-                "remote_endpoint_id": convo.remote_endpoint_id,
-                "link_id": link_id,
-                "had_record": record is not None,
-                "revoke_error": revoke_error,
-            }
-
-        def done(result: dict[str, Any]) -> None:
-            self._delete_link_local(result["local_endpoint_id"], result["remote_endpoint_id"])
-
-            if result["revoke_error"]:
-                self.set_status(
-                    f"Deleted local conversation/history, but server revoke failed: {result['revoke_error']}"
-                )
-                messagebox.showwarning(
-                    APP_NAME,
-                    "Local conversation/history was deleted, but server-side revoke failed:\n\n"
-                    f"{result['revoke_error']}",
-                )
-            elif result["had_record"]:
-                self.set_status("Link and message history deleted.")
-            else:
-                self.set_status("Conversation history deleted. No saved link record existed to revoke.")
-
-        self.run_bg(job, on_success=done, label="Deleting link")
 
         convo = self.get_selected_conversation()
         if convo is None:
@@ -1016,25 +959,27 @@ class App:
             messagebox.showerror(APP_NAME, "This conversation has no saved link record yet.")
             return
 
-        confirmed = ask_continue_cancel(
-            self.root,
-            "Delete Link",
-            "Warning: this will delete the link and all message history. "
-            "This cannot be undone.\n\nAre you sure?",
-        )
-        if not confirmed:
-            self.set_status("Delete link cancelled.")
+        link_id = str(record.get("link_id") or "")
+        if not link_id or link_id.startswith("local-"):
+            messagebox.showinfo(APP_NAME, "This conversation has no server-side link to sever.")
             return
 
-        link_id = str(record.get("link_id") or "")
+        confirmed = ask_continue_cancel(
+            self.root,
+            "Sever Link",
+            "Warning: this will sever the server-side link for this conversation. "
+            "Local message history and the contact nickname will be kept.\n\nAre you sure?",
+        )
+        if not confirmed:
+            self.set_status("Sever link cancelled.")
+            return
 
         def job() -> dict[str, Any]:
             revoke_error: str | None = None
-            if link_id and not link_id.startswith("local-"):
-                try:
-                    client.revoke_link(link_id)
-                except Exception as exc:
-                    revoke_error = str(exc)
+            try:
+                client.revoke_link(link_id)
+            except Exception as exc:
+                revoke_error = str(exc)
 
             return {
                 "local_endpoint_id": convo.local_endpoint_id,
@@ -1044,20 +989,40 @@ class App:
             }
 
         def done(result: dict[str, Any]) -> None:
-            self._delete_link_local(result["local_endpoint_id"], result["remote_endpoint_id"])
             if result["revoke_error"]:
                 self.set_status(
-                    f"Deleted local link/history, but server revoke failed: {result['revoke_error']}"
+                    f"Server-side link revoke failed: {result['revoke_error']}"
                 )
                 messagebox.showwarning(
                     APP_NAME,
-                    "Local link and history were deleted, but server-side revoke failed:\n\n"
+                    "Server-side revoke failed. Local history and contact nickname were kept:\n\n"
                     f"{result['revoke_error']}",
                 )
             else:
-                self.set_status("Link and message history deleted.")
+                self._mark_link_severed_local(result["local_endpoint_id"], result["remote_endpoint_id"])
+                self.set_status("Link severed. Local message history and contact nickname were kept.")
 
-        self.run_bg(job, on_success=done, label="Deleting link")
+        self.run_bg(job, on_success=done, label="Severing link")
+
+    def delete_message_history(self) -> None:
+        convo = self.get_selected_conversation()
+        if convo is None:
+            messagebox.showerror(APP_NAME, "Select a conversation first.")
+            return
+
+        confirmed = ask_continue_cancel(
+            self.root,
+            "Delete Message History",
+            "Warning: this will delete only the local message history for this conversation. "
+            "The link record and contact nickname will be kept. "
+            "This cannot be undone.\n\nAre you sure?",
+        )
+        if not confirmed:
+            self.set_status("Delete message history cancelled.")
+            return
+
+        deleted_count = self._delete_message_history_local(convo.local_endpoint_id, convo.remote_endpoint_id)
+        self.set_status(f"Deleted {deleted_count} message(s) from local history.")
 
     def copy_selected_pending_code(self) -> None:
         self._prune_pending_codes()
@@ -1448,7 +1413,6 @@ class App:
         existing_labels = {
             (str(item.get("local_endpoint_id")), str(item.get("remote_endpoint_id"))): str(item.get("remote_label") or "")
             for item in self.links
-            if not str(item.get("link_id", "")).startswith("local-")
         }
 
         local_stubs = [
@@ -1532,22 +1496,38 @@ class App:
             record.update(payload)
 
         self._save_links()
+
+    def _rewrite_messages_file(self) -> None:
+        MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MESSAGES_PATH.open("w", encoding="utf-8") as handle:
+            for item in self.messages:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def _rebuild_message_index(self) -> None:
+        self.message_index = {
+            str(item.get("packet_id") or item.get("delivery_id"))
+            for item in self.messages
+            if item.get("packet_id") or item.get("delivery_id")
+        }
+
     def _get_link_record(self, local_endpoint_id: str, remote_endpoint_id: str) -> dict[str, Any] | None:
         for item in self.links:
             if str(item.get("local_endpoint_id")) == local_endpoint_id and str(item.get("remote_endpoint_id")) == remote_endpoint_id:
                 return item
         return None
 
-    def _delete_link_local(self, local_endpoint_id: str, remote_endpoint_id: str) -> None:
-        self.links = [
-            item
-            for item in self.links
-            if not (
-                str(item.get("local_endpoint_id")) == local_endpoint_id
-                and str(item.get("remote_endpoint_id")) == remote_endpoint_id
-            )
-        ]
+    def _mark_link_severed_local(self, local_endpoint_id: str, remote_endpoint_id: str) -> None:
+        record = self._get_link_record(local_endpoint_id, remote_endpoint_id)
+        if record is None:
+            return
+        record["link_id"] = f"local-{local_endpoint_id}-{remote_endpoint_id}"
+        record["status"] = "severed"
+        record["updated_at"] = self._now_iso()
+        self._save_links()
+        self._refresh_conversations()
 
+    def _delete_message_history_local(self, local_endpoint_id: str, remote_endpoint_id: str) -> int:
+        original_count = len(self.messages)
         self.messages = [
             item
             for item in self.messages
@@ -1556,24 +1536,11 @@ class App:
                 and str(item.get("remote_endpoint_id")) == remote_endpoint_id
             )
         ]
-
-        self.message_index = {
-            str(item.get("packet_id") or item.get("delivery_id"))
-            for item in self.messages
-            if item.get("packet_id") or item.get("delivery_id")
-        }
-
-        self._save_links()
-        MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with MESSAGES_PATH.open("w", encoding="utf-8") as handle:
-            for item in self.messages:
-                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-        if self.selected_conversation_key == self._conversation_key(local_endpoint_id, remote_endpoint_id):
-            self.selected_conversation_key = None
-
-        self._save_config()
+        deleted_count = original_count - len(self.messages)
+        self._rebuild_message_index()
+        self._rewrite_messages_file()
         self._refresh_conversations()
+        return deleted_count
 
     def _clear_local_identity_state(self) -> None:
         self.links = []

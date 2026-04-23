@@ -41,6 +41,20 @@ ip_access_mode = "dynamic"
 [maintenance]
 cleanup_interval_seconds = 60
 
+[observability]
+health_mode = "public"
+stats_mode = "public"
+
+# Recommended production posture:
+# [observability]
+# health_mode = "public"
+# stats_mode = "off"
+#
+# Or require any valid node API key for aggregate stats:
+# [observability]
+# health_mode = "public"
+# stats_mode = "node_api_key"
+
 # When ip_access_mode = "config", this is the only client IP block list used.
 # When ip_access_mode = "dynamic", this remains a static fallback deny list.
 [blacklist]

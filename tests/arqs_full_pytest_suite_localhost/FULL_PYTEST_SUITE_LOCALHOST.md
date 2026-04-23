@@ -92,7 +92,8 @@ This test uses the live admin CLI against the running Dockerized server. It read
 
 ## What the suite covers
 
-- Public endpoint exposure: `/health`, `/stats`, `/register`
+- Public endpoint exposure checks for `/health` and `/register`
+- Config-sensitive observability handling for `/stats`
 - Authentication behavior and key rotation
 - Endpoint ownership, creation, and deletion rules
 - Link-code lifecycle, duplicate prevention, and visibility
@@ -111,7 +112,7 @@ This test uses the live admin CLI against the running Dockerized server. It read
 ## `tests/test_public_endpoints.py`
 
 ### `test_health_is_public`
-Checks that `/health` is public and returns the expected basic status structure.
+Checks that `/health` is public and returns the minimal status structure: `status` and `time`, without `app` or `db_path`.
 
 Run only this test:
 
@@ -120,7 +121,7 @@ pytest -q tests/test_public_endpoints.py::test_health_is_public
 ```
 
 ### `test_stats_is_currently_public`
-Checks that `/stats` is currently public and returns the expected stats keys.
+Checks that `/stats` returns aggregate stats plus `time` when public, and skips cleanly when stats observability is protected or disabled.
 
 Run only this test:
 

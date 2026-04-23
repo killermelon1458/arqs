@@ -48,6 +48,24 @@ def raw_json_request(
         return int(exc.code), parsed
 
 
+def observability_detail(body: Any) -> str:
+    if isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, str):
+            return detail
+    if isinstance(body, str):
+        return body
+    return repr(body)
+
+
+def assert_health_response_schema(body: Any) -> None:
+    assert isinstance(body, dict), f"Expected /health JSON object, got {body!r}"
+    assert body.get("status") == "ok", f"Expected /health status='ok', got {body!r}"
+    assert "time" in body, f"Expected /health to include time, got {body!r}"
+    assert "app" not in body, f"/health should no longer expose app, got {body!r}"
+    assert "db_path" not in body, f"/health should no longer expose db_path, got {body!r}"
+
+
 def assert_http_error(exc_info, status_code: int, detail_contains: str | None = None) -> None:
     exc = exc_info.value
     assert isinstance(exc, ARQSHTTPError), f"Expected ARQSHTTPError, got {type(exc).__name__}: {exc}"

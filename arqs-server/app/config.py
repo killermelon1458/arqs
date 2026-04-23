@@ -60,6 +60,12 @@ class MaintenanceConfig:
 
 
 @dataclass(slots=True)
+class ObservabilityConfig:
+    health_mode: str = "public"
+    stats_mode: str = "public"
+
+
+@dataclass(slots=True)
 class BlacklistConfig:
     client_ips: list[str] = field(default_factory=list)
     node_ids: list[str] = field(default_factory=list)
@@ -74,6 +80,7 @@ class AppConfig:
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     maintenance: MaintenanceConfig = field(default_factory=MaintenanceConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     blacklist: BlacklistConfig = field(default_factory=BlacklistConfig)
 
 
@@ -81,6 +88,17 @@ def _overlay_dataclass(instance, values: dict) -> None:
     for key, value in values.items():
         if hasattr(instance, key):
             setattr(instance, key, value)
+
+
+_OBSERVABILITY_MODES = {"public", "node_api_key", "off"}
+
+
+def _validate_observability_config(config: ObservabilityConfig) -> None:
+    for field_name in ("health_mode", "stats_mode"):
+        value = getattr(config, field_name)
+        if value not in _OBSERVABILITY_MODES:
+            allowed = ", ".join(sorted(_OBSERVABILITY_MODES))
+            raise ValueError(f"unsupported observability.{field_name}: {value!r}; expected one of: {allowed}")
 
 
 def load_config() -> AppConfig:
@@ -103,6 +121,9 @@ def load_config() -> AppConfig:
             _overlay_dataclass(config.network, raw["network"])
         if isinstance(raw.get("maintenance"), dict):
             _overlay_dataclass(config.maintenance, raw["maintenance"])
+        if isinstance(raw.get("observability"), dict):
+            _overlay_dataclass(config.observability, raw["observability"])
         if isinstance(raw.get("blacklist"), dict):
             _overlay_dataclass(config.blacklist, raw["blacklist"])
+    _validate_observability_config(config.observability)
     return config

@@ -166,8 +166,6 @@ class PacketAckResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    app: str
-    db_path: str
     time: datetime
 
 
@@ -178,3 +176,4 @@ class StatsResponse(BaseModel):
     queued_packets_total: int
     queued_bytes_total: int
     link_codes_active_total: int
+    time: datetime
