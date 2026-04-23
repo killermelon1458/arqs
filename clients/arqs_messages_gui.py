@@ -1014,7 +1014,7 @@ class App:
             self.root,
             "Delete Message History",
             "Warning: this will delete only the local message history for this conversation. "
-            "The link record and contact nickname will be kept. "
+            "If the link has already been severed, the conversation will also be removed from the sidebar. "
             "This cannot be undone.\n\nAre you sure?",
         )
         if not confirmed:
@@ -1537,6 +1537,22 @@ class App:
             )
         ]
         deleted_count = original_count - len(self.messages)
+
+        record = self._get_link_record(local_endpoint_id, remote_endpoint_id)
+        if record is not None and str(record.get("link_id", "")).startswith("local-"):
+            self.links = [
+                item
+                for item in self.links
+                if not (
+                    str(item.get("local_endpoint_id")) == local_endpoint_id
+                    and str(item.get("remote_endpoint_id")) == remote_endpoint_id
+                )
+            ]
+            self._save_links()
+            if self.selected_conversation_key == self._conversation_key(local_endpoint_id, remote_endpoint_id):
+                self.selected_conversation_key = None
+                self._save_config()
+
         self._rebuild_message_index()
         self._rewrite_messages_file()
         self._refresh_conversations()
