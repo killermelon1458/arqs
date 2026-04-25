@@ -16,6 +16,7 @@ Design choices in this client:
 - standard-library only; no third-party client dependency required
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -228,6 +229,9 @@ class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
         return None
 
 
+ARQSTraceHook = Callable[[dict[str, Any]], None]
+
+
 class ARQSClient:
     """Thin synchronous client for the ARQS server HTTP API."""
 
@@ -241,6 +245,7 @@ class ARQSClient:
         user_agent: str = "arqs_api.py/1.0",
         transport_policy: TransportPolicy = "prefer_https",
         allow_local_http_auth: bool = True,
+        trace_hook: ARQSTraceHook | None = None,
     ) -> None:
         self.base_url = _normalize_base_url(base_url)
         self.api_key = api_key
@@ -249,6 +254,7 @@ class ARQSClient:
         self.user_agent = user_agent
         self.transport_policy = _normalize_transport_policy(transport_policy)
         self.allow_local_http_auth = bool(allow_local_http_auth)
+        self.trace_hook = trace_hook
         self.identity: NodeIdentity | None = None
         self.last_request_requested_url: str | None = None
         self.last_request_final_url: str | None = None
@@ -287,6 +293,9 @@ class ARQSClient:
     def adopt_identity(self, identity: NodeIdentity) -> None:
         self.identity = identity
         self.api_key = identity.api_key
+
+    def set_trace_hook(self, trace_hook: ARQSTraceHook | None) -> None:
+        self.trace_hook = trace_hook
 
     def save_identity(self, path: str | Path) -> Path:
         if self.identity is None:
@@ -566,12 +575,36 @@ class ARQSClient:
             else:
                 headers[self.api_key_header] = self.api_key
 
+        request_headers = _redact_trace_headers(headers)
+        request_body = body_bytes.decode("utf-8") if body_bytes is not None else None
+        self._emit_trace(
+            "http_request",
+            method=method.upper(),
+            path=path,
+            url=url,
+            params=params or {},
+            headers=request_headers,
+            body=request_body,
+            timeout_seconds=effective_timeout,
+            require_auth=require_auth,
+        )
         req = urllib_request.Request(url=url, data=body_bytes, headers=headers, method=method.upper())
         try:
             with urllib_request.urlopen(req, timeout=effective_timeout) as response:
                 final_url = _normalize_observed_url(response.geturl()) or url
                 self._record_last_request(url, final_url)
                 raw = response.read().decode("utf-8")
+                self._emit_trace(
+                    "http_response",
+                    method=method.upper(),
+                    path=path,
+                    url=url,
+                    final_url=final_url,
+                    redirected=bool(final_url != url),
+                    status_code=response.getcode(),
+                    headers=dict(response.headers.items()),
+                    raw_body=raw,
+                )
                 if not raw:
                     return None
                 return json.loads(raw)
@@ -590,12 +623,38 @@ class ARQSClient:
                         detail = parsed
                 except Exception:
                     detail = raw
+            self._emit_trace(
+                "http_response_error",
+                method=method.upper(),
+                path=path,
+                url=url,
+                final_url=final_url,
+                redirected=bool(final_url != url),
+                status_code=exc.code,
+                headers=dict(exc.headers.items()),
+                raw_body=raw,
+                detail=detail,
+            )
             raise ARQSHTTPError(exc.code, detail, response_json=parsed, response_text=raw) from exc
         except urllib_error.URLError as exc:
             self._record_last_request(url, None)
+            self._emit_trace(
+                "http_transport_error",
+                method=method.upper(),
+                path=path,
+                url=url,
+                error=str(exc),
+            )
             raise ARQSConnectionError(f"failed to reach ARQS server at {url}: {exc}") from exc
         except TimeoutError as exc:
             self._record_last_request(url, None)
+            self._emit_trace(
+                "http_transport_error",
+                method=method.upper(),
+                path=path,
+                url=url,
+                error=str(exc),
+            )
             raise ARQSConnectionError(f"request to ARQS server timed out after {effective_timeout} seconds") from exc
 
     def _build_url(self, path: str, *, params: dict[str, Any] | None = None) -> str:
@@ -684,6 +743,21 @@ class ARQSClient:
         self.last_request_final_url = final_url
         self.last_request_redirected = bool(final_url and final_url != requested_url)
 
+    def _emit_trace(self, event: str, **payload: Any) -> None:
+        if self.trace_hook is None:
+            return
+        try:
+            self.trace_hook(
+                {
+                    "event": event,
+                    "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "base_url": self.base_url,
+                    **payload,
+                }
+            )
+        except Exception:
+            return
+
 
 def _stringify_id(value: str | uuid.UUID) -> str:
     if isinstance(value, uuid.UUID):
@@ -755,6 +829,18 @@ def _normalize_api_key_header(value: str) -> str:
     if lowered == AUTHORIZATION_HEADER.lower():
         return AUTHORIZATION_HEADER
     raise ValueError("api_key_header must be 'X-ARQS-API-Key' or 'Authorization'")
+
+
+def _redact_trace_headers(headers: dict[str, Any]) -> dict[str, Any]:
+    redacted: dict[str, Any] = {}
+    for key, value in headers.items():
+        lowered = str(key).strip().lower()
+        if lowered in {DEFAULT_API_KEY_HEADER.lower(), AUTHORIZATION_HEADER.lower()}:
+            raw = str(value or "")
+            redacted[key] = f"<redacted:{len(raw)} chars>"
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def _parse_uuid(value: Any) -> uuid.UUID:

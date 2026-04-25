@@ -12,6 +12,8 @@ What this bot does:
 - Supports link management through Discord slash commands.
 - Routes normal DM messages to the active contact, or to the replied-to contact.
 - Long-polls ARQS continuously and forwards inbound messages into Discord DMs.
+- Sends Discord-originated messages as convention-compliant `message.v1` packets.
+- Renders convention-compliant inbound packets through the shared client-side decoder before forwarding to Discord.
 - Keeps destructive identity deletion behind a CLI flag only.
 
 Install:
@@ -24,6 +26,7 @@ Config file example (JSON):
 {
   "base_url": "http://127.0.0.1:8000",
   "node_name": "discord-adapter",
+  "transport_policy": "prefer_https",
   "state_dir": "~/.arqs_discord_adapter",
   "poll_wait_seconds": 20,
   "poll_limit": 100,
@@ -35,10 +38,21 @@ Run:
     python discord_adapter.py --config ~/.arqs_discord_adapter/config.json
     python discord_adapter.py --config ~/.arqs_discord_adapter/config.json --sync-commands
     python discord_adapter.py --config ~/.arqs_discord_adapter/config.json --delete-identity
+
+Transport policy:
+    allow_http    = keep HTTP when explicitly configured, even if HTTPS is also available
+    prefer_https  = upgrade to HTTPS when available; remote HTTP-only servers require an explicit opt-in
+    require_https = fail startup unless HTTPS is reachable
+
+Notes:
+    - Transport probing is client-side only. It does not change the ARQS server or HTTP API.
+    - If an HTTP base URL redirects to HTTPS, the adapter upgrades automatically at startup.
+    - Local/private HTTP-only servers are still allowed under prefer_https so homelab localhost/private-network setups keep working.
 """
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -49,6 +63,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib import parse as urllib_parse
 
 # Resolve `arqs_api` by script location so the adapter works with a local copy,
 # the repo-shared `/apis` copy, or an installed module.
@@ -64,7 +79,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from arqs_api import ARQSClient, ARQSError, ARQSHTTPError, Link, LinkCode, NodeIdentity
+from arqs_api import ARQSClient, ARQSError, ARQSHTTPError, Link, LinkCode, NodeIdentity, TransportPolicy
+from arqs_conventions import build_client_meta, build_v1_headers, render_packet_text
 
 
 LinkMode = Literal["bidirectional", "a_to_b", "b_to_a"]
@@ -73,6 +89,7 @@ LinkMode = Literal["bidirectional", "a_to_b", "b_to_a"]
 DEFAULT_CONFIG = {
     "base_url": "http://127.0.0.1:8000",
     "node_name": "discord-adapter",
+    "transport_policy": "prefer_https",
     "state_dir": "~/.arqs_discord_adapter",
     "poll_wait_seconds": 20,
     "poll_limit": 100,
@@ -111,8 +128,6 @@ def format_expiry_for_display(expires_at: datetime) -> str:
 
     minute_label = "minute" if remaining_minutes == 1 else "minutes"
     return f"Expires in {remaining_minutes} {minute_label} at {local_dt.strftime('%I:%M %p %Z')}"
-    minute_label = "minute" if remaining_minutes == 1 else "minutes"
-    return f"Expires in {remaining_minutes} {minute_label} at {local_dt.strftime('%I:%M %p %Z')}"
 
 def json_dump(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,6 +147,7 @@ def json_load(path: Path, default: Any) -> Any:
 class AdapterConfig:
     base_url: str
     node_name: str
+    transport_policy: TransportPolicy
     state_dir: Path
     poll_wait_seconds: int = 20
     poll_limit: int = 100
@@ -154,14 +170,123 @@ class AdapterConfig:
 
         state_dir = Path(os.path.expanduser(str(merged["state_dir"]))).resolve()
         return cls(
-            base_url=str(merged["base_url"]).rstrip("/"),
+            base_url=normalize_base_url(str(merged["base_url"])),
             node_name=str(merged.get("node_name") or "discord-adapter"),
+            transport_policy=normalize_transport_policy(merged.get("transport_policy", "prefer_https")),
             state_dir=state_dir,
             poll_wait_seconds=max(0, min(60, int(merged.get("poll_wait_seconds", 20)))),
             poll_limit=max(1, min(1000, int(merged.get("poll_limit", 100)))),
             sync_commands_on_start=bool(merged.get("sync_commands_on_start", False)),
             log_level=str(merged.get("log_level", "INFO")).upper(),
         )
+
+
+def normalize_base_url(base_url: str) -> str:
+    raw = str(base_url or "").strip()
+    if not raw:
+        raise SystemExit("Config value 'base_url' is required.")
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parts = urllib_parse.urlsplit(raw)
+    if not parts.netloc:
+        raise SystemExit("Config value 'base_url' must include an http:// or https:// host.")
+    path = parts.path.rstrip("/")
+    return urllib_parse.urlunsplit((parts.scheme.lower(), parts.netloc, path, "", ""))
+
+
+def normalize_transport_policy(value: Any) -> TransportPolicy:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"allow_http", "prefer_https", "require_https"}:
+        return normalized
+    raise SystemExit("Config value 'transport_policy' must be 'allow_http', 'prefer_https', or 'require_https'.")
+
+
+def _transport_failure_message(probe: Any) -> str:
+    details: list[str] = []
+    if probe.http_attempt is not None and probe.http_attempt.error:
+        details.append(f"HTTP probe failed: {probe.http_attempt.error}")
+    if probe.https_attempt is not None and probe.https_attempt.error:
+        details.append(f"HTTPS probe failed: {probe.https_attempt.error}")
+    if not details:
+        return ""
+    return " " + " ".join(details)
+
+
+def _is_local_server_url(base_url: str) -> bool:
+    host = urllib_parse.urlsplit(base_url).hostname
+    if not host:
+        return False
+    lowered = host.lower()
+    if lowered in {"localhost", "::1"}:
+        return True
+    try:
+        address = ipaddress.ip_address(lowered)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private or address.is_link_local
+
+
+def resolve_runtime_transport(config: AdapterConfig, log: logging.Logger) -> AdapterConfig:
+    probe = ARQSClient(config.base_url).probe_transport()
+    upgraded = probe.normalized_https_base_url or probe.recommended_base_url
+
+    if config.base_url.startswith("https://"):
+        if probe.classification == "https_failed":
+            raise SystemExit(f"Configured HTTPS base_url is not reachable.{_transport_failure_message(probe)}")
+        return config
+
+    if probe.classification == "http_redirects_to_https":
+        if not upgraded:
+            raise SystemExit("Server redirects to HTTPS, but the upgraded URL could not be determined.")
+        log.info("Server redirects HTTP to HTTPS. Using %s.", upgraded)
+        config.base_url = upgraded
+        return config
+
+    if probe.classification == "https_only":
+        if not upgraded:
+            raise SystemExit("HTTPS is available, but the upgraded URL could not be determined.")
+        log.info("Server is reachable only over HTTPS. Using %s.", upgraded)
+        config.base_url = upgraded
+        return config
+
+    if probe.classification == "both_http_and_https" and config.transport_policy != "allow_http":
+        if not upgraded:
+            raise SystemExit("HTTPS is available, but the upgraded URL could not be determined.")
+        log.info(
+            "HTTPS is available for %s. Using %s because transport_policy=%s.",
+            probe.original_base_url,
+            upgraded,
+            config.transport_policy,
+        )
+        config.base_url = upgraded
+        return config
+
+    if probe.classification == "both_http_and_https" and config.transport_policy == "allow_http":
+        log.warning("Both HTTP and HTTPS are available for %s. Keeping HTTP because transport_policy=allow_http.", config.base_url)
+        return config
+
+    if probe.classification == "http_only":
+        if config.transport_policy == "require_https":
+            raise SystemExit(
+                f"HTTPS is required by transport_policy, but only HTTP is reachable for {config.base_url}."
+                f"{_transport_failure_message(probe)}"
+            )
+        if config.transport_policy == "allow_http":
+            log.warning("Only HTTP is reachable for %s. Continuing because transport_policy=allow_http.", config.base_url)
+            return config
+        if _is_local_server_url(config.base_url):
+            log.warning("Only HTTP is reachable for local/private server %s. Continuing with local HTTP transport.", config.base_url)
+            return config
+        raise SystemExit(
+            f"Only HTTP is reachable for {config.base_url}, and transport_policy=prefer_https would block authenticated requests. "
+            "Set transport_policy to allow_http to continue explicitly, or enable HTTPS."
+            f"{_transport_failure_message(probe)}"
+        )
+
+    if probe.classification == "unreachable":
+        raise SystemExit(f"Could not reach {config.base_url} over HTTP or HTTPS.{_transport_failure_message(probe)}")
+
+    raise SystemExit(f"Transport probing failed for {config.base_url}.{_transport_failure_message(probe)}")
 
 
 @dataclass
@@ -265,7 +390,7 @@ class RuntimeStore:
             self.log.info("Loaded existing ARQS identity for node %s", identity.node_id)
             return identity
 
-        client = ARQSClient(self.config.base_url)
+        client = ARQSClient(self.config.base_url, transport_policy=self.config.transport_policy)
         identity = client.register(node_name=self.config.node_name, adopt_identity=False)
         identity.save(self.identity_path)
         self.log.info("Registered new ARQS identity for node %s", identity.node_id)
@@ -273,8 +398,12 @@ class RuntimeStore:
 
     def load_client(self) -> ARQSClient:
         if self.identity_path.exists():
-            return ARQSClient.from_identity_file(self.config.base_url, self.identity_path)
-        return ARQSClient(self.config.base_url)
+            return ARQSClient.from_identity_file(
+                self.config.base_url,
+                self.identity_path,
+                transport_policy=self.config.transport_policy,
+            )
+        return ARQSClient(self.config.base_url, transport_policy=self.config.transport_policy)
 
     def delete_identity_file(self) -> None:
         try:
@@ -438,12 +567,15 @@ class ARQSDiscordBot(commands.Bot):
             )
             return
 
-        meta = {
-            "adapter": "discord_dm",
-            "discord_user_id": str(message.author.id),
-            "discord_user": str(message.author),
-            "discord_message_id": str(message.id),
-        }
+        meta = build_client_meta(
+            client="arqs_discord_adapter",
+            adapter="discord_dm",
+            extra_meta={
+                "discord_user_id": str(message.author.id),
+                "discord_user": str(message.author),
+                "discord_message_id": str(message.id),
+            },
+        )
         if message.reference and message.reference.message_id:
             meta["discord_reply_to_message_id"] = str(message.reference.message_id)
 
@@ -454,7 +586,7 @@ class ARQSDiscordBot(commands.Bot):
                 to_endpoint_id=binding.remote_endpoint_id,
                 body=message.content,
                 data=None,
-                headers={"content_type": "text/plain"},
+                headers=build_v1_headers("message.v1", content_type="text/plain; charset=utf-8"),
                 meta=meta,
             )
         except Exception as exc:
@@ -567,11 +699,11 @@ class ARQSDiscordBot(commands.Bot):
                 self.log.warning("ACK failed for unknown delivery %s: %s", delivery_id, exc)
             return
 
-        content = str(packet.body or "")
-        if not content and packet.data:
-            content = json.dumps(packet.data, ensure_ascii=False, indent=2)
-        if not content:
-            content = "[empty message]"
+        content = render_packet_text(
+            body=packet.body,
+            data=packet.data,
+            headers=packet.headers,
+        )
 
         forwarded = f"[{binding.label}] {content}"
         forwarded_chunks = self._split_message(forwarded)
@@ -1162,6 +1294,7 @@ def main() -> None:
     config = AdapterConfig.load(args.config)
     configure_logging(config.log_level)
     log = logging.getLogger("arqs.discord.main")
+    config = resolve_runtime_transport(config, log)
 
     token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     if not token:

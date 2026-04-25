@@ -30,6 +30,7 @@ for _candidate in (SCRIPT_DIR, SCRIPT_DIR.parent / "apis"):
         break
 
 from arqs_api import ARQSClient, ARQSHTTPError, Endpoint, Link, LinkCode, TransportProbeResult, TransportPolicy
+from arqs_conventions import build_client_meta, build_v1_headers, get_packet_type, render_packet_text
 
 APP_NAME = "ARQS Messages GUI"
 APP_DIR = Path.home() / ".arqs_messages_gui"
@@ -326,6 +327,50 @@ class App:
             SESSION_LOG_PATH.rename(rotated)
         SESSION_LOG_PATH.write_text("", encoding="utf-8")
 
+    def _attach_terminal_trace(self, client: ARQSClient | None) -> None:
+        if client is None:
+            return
+        client.set_trace_hook(self._handle_client_trace)
+
+    def _terminal_json(self, value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+
+    def _write_terminal_record(self, label: str, payload: Any, *, stream: Any | None = None) -> None:
+        target = stream if stream is not None else sys.stdout
+        try:
+            print(f"[ARQS GUI] {label}", file=target, flush=True)
+            print(self._terminal_json(payload), file=target, flush=True)
+        except Exception:
+            return
+
+    def _handle_client_trace(self, event: dict[str, Any]) -> None:
+        event_name = str(event.get("event") or "trace")
+        stream = sys.stderr if "error" in event_name else sys.stdout
+        label_map = {
+            "http_request": "HTTP request",
+            "http_response": "HTTP response",
+            "http_response_error": "HTTP response error",
+            "http_transport_error": "HTTP transport error",
+        }
+        self._write_terminal_record(label_map.get(event_name, f"Client trace {event_name}"), event, stream=stream)
+        if event_name != "http_response" or str(event.get("path") or "") != "/inbox":
+            return
+        raw_body = event.get("raw_body")
+        if not raw_body:
+            return
+        try:
+            parsed = json.loads(str(raw_body))
+        except json.JSONDecodeError:
+            return
+        deliveries = parsed.get("deliveries")
+        if not isinstance(deliveries, list):
+            return
+        for index, delivery in enumerate(deliveries, start=1):
+            self._write_terminal_record(
+                f"Raw incoming delivery {index}/{len(deliveries)}",
+                delivery,
+            )
+
     def _log_event(self, event_type: str, **payload: Any) -> None:
         base_url = self.base_url_var.get().strip() if hasattr(self, "base_url_var") else str(self.config.get("base_url", ""))
         node_id = None
@@ -343,6 +388,8 @@ class App:
         with self.session_log_lock:
             with SESSION_LOG_PATH.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        stream = sys.stderr if "error" in event_type or "exception" in event_type else sys.stdout
+        self._write_terminal_record(f"GUI event {event_type}", record, stream=stream)
 
     def _format_exception_trace(self, exc: BaseException) -> str:
         return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -395,6 +442,9 @@ class App:
         return False
 
     def _is_ping_packet(self, *, headers: dict[str, Any] | None, body: str | None) -> bool:
+        packet_type = get_packet_type(headers)
+        if packet_type == "ping.v1":
+            return self._parse_ping_number(body) is not None
         return self._is_ping_marker(headers) and self._parse_ping_number(body) is not None
 
     def _build_ping_payload(
@@ -414,14 +464,15 @@ class App:
         }
         if reply_to_packet_id:
             data[PING_REPLY_TO_PACKET_DATA_KEY] = str(reply_to_packet_id)
-        headers = {
-            "content_type": "text/plain",
-            PING_HEADER_NAME: PING_HEADER_VALUE,
-        }
-        meta = {
-            "client": APP_NAME,
-            "message_kind": "gui_ping",
-        }
+        headers = build_v1_headers(
+            "ping.v1",
+            content_type="text/plain; charset=utf-8",
+            extra_headers={PING_HEADER_NAME: PING_HEADER_VALUE},
+        )
+        meta = build_client_meta(
+            client="arqs_messages_gui",
+            extra_meta={"message_kind": "gui_ping"},
+        )
         return f"ping {int(ping_number)}", data, headers, meta
 
     def _remember_outgoing_ping(
@@ -681,15 +732,18 @@ class App:
                     IDENTITY_PATH,
                     transport_policy=effective_policy,
                 )
+                self._attach_terminal_trace(self.client)
                 if update_status and self.client.identity is not None:
                     self.set_status(f"Loaded identity for node {self.client.identity.node_id}.")
                 return
             except Exception as exc:
                 self.client = ARQSClient(base_url, transport_policy=effective_policy)
+                self._attach_terminal_trace(self.client)
                 if update_status:
                     self.set_status(f"Identity file exists but failed to load: {exc}")
                 return
         self.client = ARQSClient(base_url, transport_policy=effective_policy)
+        self._attach_terminal_trace(self.client)
         if previous_identity is not None and self.client.identity is None:
             self.client.adopt_identity(previous_identity)
         if update_status:
@@ -703,7 +757,9 @@ class App:
         cached = self.transport_probe_cache.get(normalized)
         if cached is not None:
             return cached
-        result = ARQSClient(normalized).probe_transport()
+        probe_client = ARQSClient(normalized)
+        self._attach_terminal_trace(probe_client)
+        result = probe_client.probe_transport()
         self.transport_probe_cache[normalized] = result
         return result
 
@@ -981,10 +1037,12 @@ class App:
             direction = item.get("direction", "unknown")
             who = "You" if direction == "outgoing" else contact_name
             timestamp = self._format_dt(item.get("created_at") or item.get("received_at"))
-            body = str(item.get("body") or "")
-            if not body and item.get("data"):
-                body = json.dumps(item.get("data"), ensure_ascii=False, indent=2)
-            lines.append(f"[{timestamp}] {who}:\n{body}\n")
+            body_text = render_packet_text(
+                body=item.get("body"),
+                data=item.get("data"),
+                headers=item.get("headers"),
+            )
+            lines.append(f"[{timestamp}] {who}:\n{body_text}\n")
 
         self._set_history_text("\n".join(lines).strip())
 
@@ -1020,6 +1078,7 @@ class App:
         node_name = self.node_name_var.get().strip() or None
         effective_url = self._normalize_server_url_for_gui(self.base_url_var.get().strip())
         self.client = ARQSClient(effective_url, transport_policy=self._current_transport_policy(effective_url))
+        self._attach_terminal_trace(self.client)
 
         def job() -> tuple[str, str]:
             assert self.client is not None
@@ -1312,8 +1371,8 @@ class App:
         body = self.message_entry.get("1.0", tk.END).strip()
         if not body:
             return
-        headers = {"content_type": "text/plain"}
-        meta = {"client": APP_NAME}
+        headers = build_v1_headers("message.v1", content_type="text/plain; charset=utf-8")
+        meta = build_client_meta(client="arqs_messages_gui")
 
         def job() -> dict[str, Any]:
             sent_at = self._now_iso()

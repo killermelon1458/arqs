@@ -107,9 +107,9 @@ At the time of writing, the project includes:
 
 The Python client exposes node registration, endpoint management, link request/redeem/revoke, packet sending, inbox polling, delivery acknowledgement, health, and stats operations. 
 
-The included Discord adapter is currently **DM-only v1** and uses long-polling to bridge ARQS deliveries into Discord DMs. 
+The included Discord adapter is currently **DM-only v1** and uses long-polling to bridge ARQS deliveries into Discord DMs. It now also applies the shared client-side header convention for adapter-originated packets and has configurable HTTP/HTTPS startup behavior.
 
-The GUI client provides a simple local messaging interface on top of the same transport model, including registration, endpoints, link codes, inbox polling, message sending, and local conversation history. 
+The GUI client provides a simple local messaging interface on top of the same transport model, including registration, endpoints, link codes, inbox polling, message sending, and local conversation history. It also emits convention-compliant client-side packet headers for new messages and pings while remaining compatible with older packets.
 
 ## Project status
 
