@@ -77,12 +77,15 @@ script.failure.traceback.v1
 receipt.received.v1
 receipt.processed.v1
 receipt.read.v1
+reaction.v1
 blob.manifest.v1
 blob.chunk.v1
 blob.receipt.v1
 encrypted.v1
 command.v1
 command.response.v1
+presence.ping.v1
+presence.pong.v1
 ping.v1
 
 The type version is included in the value, not the key.
@@ -209,19 +212,26 @@ A list of client-level receipt types requested by the sender.
 
 Example:
 
-"receipt_request": ["received", "processed", "read"]
+"receipt_request": ["received", "processed"]
 
 Supported values:
 
-received  = receiver client obtained and durably stored the packet
-processed = receiver client successfully handled the packet
-read      = a human user viewed/read the message
+received
+  Receiver client obtained and durably accepted/saved the packet.
+
+processed
+  Receiver application or handler successfully processed the packet.
+
+read
+  A human user viewed/read the packet.
 
 Rules:
 
 Receipts must not request receipts.
 If arqs_type starts with receipt., clients should ignore receipt_request.
 Unsupported receipt types may be ignored.
+Receipt requests are client-level behavior, not server-level ACK behavior.
+The ARQS server must not interpret receipt_request.
 
 correlation_id
 
@@ -230,14 +240,23 @@ A UUID used to group related packets together.
 Useful for:
 
 command/response chains
+presence ping/pong exchanges
 file transfers
 multi-packet workflows
+receipt chains
 logs/tracing
 conversation threads
 
 Example:
 
 "correlation_id": "9b777b0e-6d7a-40b1-9c39-885d7bbd76a1"
+
+Rules:
+
+A response packet should preserve the original packet's correlation_id when one exists.
+A receipt packet should preserve the original packet's correlation_id when one exists.
+Clients may generate a new correlation_id when starting a new workflow, such as a command request or presence ping.
+Clients should not generate a new correlation_id for a simple receipt if the original packet did not have one.
 
 causation_id
 
@@ -253,6 +272,14 @@ workflow tracing
 Example:
 
 "causation_id": "uuid-of-original-packet"
+
+Rules:
+
+A command response should set causation_id to the command packet's packet_id.
+A receipt should set causation_id to the original packet's packet_id.
+A reaction should set causation_id to the packet_id of the message being reacted to.
+A presence pong should set causation_id to the original presence ping packet's packet_id.
+causation_id identifies the direct cause, not necessarily the whole workflow.
 
 Versioning Rules
 
@@ -402,17 +429,27 @@ Received Receipt
     "content_type": "application/json",
     "content_transfer_encoding": "utf-8",
     "content_encoding": "identity",
-    "encryption": "none"
+    "encryption": "none",
+    "causation_id": "uuid-of-original-packet"
   },
   "body": null,
   "data": {
     "receipt_id": "uuid",
     "for_packet_id": "uuid-of-original-packet",
+    "receipt_type": "received",
+    "status": "ok",
     "received_at": "2026-04-24T13:00:00Z"
   },
   "meta": {
     "client": "arqs_appkit"
   }
+}
+
+If the original packet had a correlation_id, copy it:
+
+{
+  "correlation_id": "original-correlation-id",
+  "causation_id": "uuid-of-original-packet"
 }
 
 Processed Receipt
@@ -424,14 +461,16 @@ Processed Receipt
     "content_type": "application/json",
     "content_transfer_encoding": "utf-8",
     "content_encoding": "identity",
-    "encryption": "none"
+    "encryption": "none",
+    "causation_id": "uuid-of-original-packet"
   },
   "body": null,
   "data": {
     "receipt_id": "uuid",
     "for_packet_id": "uuid-of-original-packet",
-    "processed_at": "2026-04-24T13:01:00Z",
-    "status": "success"
+    "receipt_type": "processed",
+    "status": "success",
+    "processed_at": "2026-04-24T13:01:00Z"
   },
   "meta": {
     "client": "arqs_appkit"
@@ -447,18 +486,197 @@ Read Receipt
     "content_type": "application/json",
     "content_transfer_encoding": "utf-8",
     "content_encoding": "identity",
-    "encryption": "none"
+    "encryption": "none",
+    "causation_id": "uuid-of-original-packet"
   },
   "body": null,
   "data": {
     "receipt_id": "uuid",
     "for_packet_id": "uuid-of-original-packet",
+    "receipt_type": "read",
     "read_at": "2026-04-24T13:05:00Z"
   },
   "meta": {
     "client": "arqs_messages_gui"
   }
 }
+
+Reaction Example
+
+`reaction.v1` records that a user added or removed an emoji reaction to another ARQS packet. It is independent from `receipt.read.v1`: a client may send both for one user action, but the convention does not require every reaction to universally mean read.
+
+Required `data` fields:
+
+* `reaction_id`
+* `reaction_key`
+* `for_packet_id`
+* `action`, with value `set` or `remove`
+* `emoji_name`
+* `source_platform`
+* `source_user_id`
+* `reacted_at`
+
+`reaction_id` identifies this reaction event packet. `reaction_key` identifies the durable active reaction slot and must be stable across the matching `set` and `remove` packets.
+
+Build `reaction_key` from:
+
+for_packet_id + source_platform + source_user_id + emoji identity
+
+Emoji identity uses this precedence:
+
+emoji_id
+emoji
+emoji_name
+
+`set` upserts the active reaction for `reaction_key`. `remove` deletes the active reaction for `reaction_key`. Multiple active reactions for the same `for_packet_id` are allowed, so adding a new emoji must not remove older emoji reactions. Duplicate `set` packets are idempotent, and duplicate or already-removed `remove` packets should be harmless.
+
+Optional `data` fields:
+
+* `emoji_id`
+* `animated`
+* `source_message_id`
+
+Relationship headers should preserve the original packet's `correlation_id` when one is available and set `causation_id` to `for_packet_id`.
+
+`emoji` should contain the portable Unicode glyph when one exists. Discord custom emoji may instead use `emoji_name`, `emoji_id`, and `animated`; other clients are not required to fetch Discord emoji assets and may display a text fallback such as `:party_blob:`.
+
+For add:
+
+{
+  "headers": {
+    "arqs_envelope": "v1",
+    "arqs_type": "reaction.v1",
+    "content_type": "application/json",
+    "content_transfer_encoding": "utf-8",
+    "content_encoding": "identity",
+    "encryption": "none",
+    "correlation_id": "original-correlation-id",
+    "causation_id": "uuid-of-original-packet"
+  },
+  "body": "reacted with 🔥",
+  "data": {
+    "reaction_id": "uuid",
+    "reaction_key": "reaction.v1:stable-key",
+    "for_packet_id": "uuid-of-original-packet",
+    "action": "set",
+    "emoji": "🔥",
+    "emoji_name": "fire",
+    "source_platform": "discord",
+    "source_user_id": "123456789",
+    "reacted_at": "2026-04-26T12:00:00Z"
+  },
+  "meta": {
+    "client": "arqs_appkit"
+  }
+}
+
+For removal:
+
+{
+  "headers": {
+    "arqs_envelope": "v1",
+    "arqs_type": "reaction.v1",
+    "content_type": "application/json",
+    "content_transfer_encoding": "utf-8",
+    "content_encoding": "identity",
+    "encryption": "none",
+    "causation_id": "uuid-of-original-packet"
+  },
+  "body": "removed reaction :party_blob:",
+  "data": {
+    "reaction_id": "uuid",
+    "reaction_key": "reaction.v1:same-stable-key-as-the-set-packet",
+    "for_packet_id": "uuid-of-original-packet",
+    "action": "remove",
+    "emoji_name": "party_blob",
+    "emoji_id": "discord-custom-emoji-id",
+    "animated": false,
+    "source_platform": "discord",
+    "source_user_id": "123456789",
+    "source_message_id": "discord-message-id",
+    "reacted_at": "2026-04-26T12:05:00Z"
+  },
+  "meta": {
+    "client": "arqs_appkit"
+  }
+}
+
+Clients with reaction support may render a reaction UI. Other clients may display the body text, or fall back to their usual unknown packet rendering.
+
+Presence Packet Types
+
+Presence pings are separate from diagnostic ping.v1 traffic. Use presence.ping.v1 and presence.pong.v1 for runtime availability checks.
+
+Presence Ping Example
+
+{
+  "headers": {
+    "arqs_envelope": "v1",
+    "arqs_type": "presence.ping.v1",
+    "content_type": "application/json",
+    "content_transfer_encoding": "utf-8",
+    "content_encoding": "identity",
+    "encryption": "none",
+    "correlation_id": "ping-exchange-uuid"
+  },
+  "body": "presence ping",
+  "data": {
+    "ping_id": "uuid",
+    "sent_at": "2026-04-24T13:00:00Z",
+    "reply_requested": true,
+    "nonce": "random-string",
+    "max_hops": 1
+  },
+  "meta": {
+    "client": "arqs_appkit"
+  }
+}
+
+Recommended behavior:
+
+Use a short packet TTL, such as 30-120 seconds.
+reply_requested defaults to true.
+max_hops defaults to 1.
+Clients must not auto-reply to stale pings.
+Clients must not auto-reply unless presence response is explicitly allowed.
+
+Presence Pong Example
+
+{
+  "headers": {
+    "arqs_envelope": "v1",
+    "arqs_type": "presence.pong.v1",
+    "content_type": "application/json",
+    "content_transfer_encoding": "utf-8",
+    "content_encoding": "identity",
+    "encryption": "none",
+    "correlation_id": "same-ping-exchange-uuid",
+    "causation_id": "original-presence-ping-packet-id"
+  },
+  "body": "presence pong",
+  "data": {
+    "pong_id": "uuid",
+    "for_ping_id": "original-ping-id",
+    "original_sent_at": "2026-04-24T13:00:00Z",
+    "received_at": "2026-04-24T13:00:02Z",
+    "responded_at": "2026-04-24T13:00:02Z",
+    "status": "online",
+    "nonce": "same-random-string"
+  },
+  "meta": {
+    "client": "arqs_appkit"
+  }
+}
+
+Rules:
+
+Auto-reply only to presence.ping.v1.
+Never auto-reply to presence.pong.v1.
+Preserve the ping's correlation_id if present.
+Set causation_id to the ping packet's packet_id.
+Echo the ping nonce when one is provided.
+Presence response must be opt-in.
+If presence response is disabled, clients should usually silently ignore the ping.
 
 Blob Manifest Example
 
@@ -646,6 +864,31 @@ Command Response Example
   }
 }
 
+Transport ACK vs Client Receipt
+
+ARQS transport ACK:
+  Sent to the server with /packet_ack.
+  Means the destination node accepted server delivery and the server may delete the delivery.
+  Does not mean a remote application processed or displayed the packet.
+
+Client receipt packet:
+  Sent as a normal ARQS packet back to the original sender.
+  Means a receiver endpoint/client is reporting received, processed, read, or failed status.
+
+A packet can be transport-ACKed without any client receipt being sent.
+A client receipt can fail to send even after the original packet was transport-ACKed.
+
+Return Route Requirement
+
+Receipts and presence pongs require a usable route back to the original sender.
+
+Rules:
+
+If the link is bidirectional, receipts and pongs can normally be sent back.
+If the link is one-way, receipts and pongs require a separate reverse route.
+Clients should not imply that receipt delivery is possible when no reverse route exists.
+If sending a receipt or pong fails due to route/link problems, the client may place it in dead-letter or mark it as failed.
+
 What Should Not Go In Headers
 
 Bad:
@@ -686,6 +929,7 @@ Clients should:
 5. Decrypt according to encryption, if supported.
 6. Dispatch by arqs_type.
 7. Send requested receipts if supported and appropriate.
+8. Treat transport ACK and client receipts as separate behaviors.
 
 Clients should not:
 
@@ -694,6 +938,7 @@ send receipts for receipts
 put large payloads in headers
 put secrets in outer headers of encrypted packets
 retry invalid packets forever
+auto-reply to presence.pong.v1
 
 Server Handling Rule
 

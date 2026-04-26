@@ -6,6 +6,8 @@
 
 It is intentionally small, standard-library only, and aligned to the server behavior that exists now. It is a transport client, not a full application framework.
 
+For the higher-level application helper layer, see [appkit/README.md](./appkit/README.md).
+
 ## Design goals
 
 * mirror the concrete server API closely
